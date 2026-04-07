@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-LECTOR DE NÓMINAS - FASE 3: Sistema Inteligente de Plantillas
-Versión: 3.0.0
+LECTOR DE NÓMINAS - FASE 3.5: OpenDataLoader + Sistema Inteligente
+Versión: 3.5.0
 Fecha: 2026-04-07
 Autor: Claude para Jurado Asesores Tributarios - 2026
 
@@ -25,12 +25,19 @@ FUNCIONALIDADES FASE 3:
 - Sistema de plantillas con aprendizaje automático
 - Auto-detección del tipo de documento (fingerprint)
 - Modo aprendizaje guiado para nuevos formatos
-- Extracción inteligente de conceptos y importes
+- Extracción inteligente de conceptos e importes
 - Mapeo automático a cuentas contables
 - Mejora continua con cada corrección del usuario
+
+FUNCIONALIDADES FASE 3.5 (NUEVA):
+- Integración con OpenDataLoader PDF (precisión 0.907)
+- Extracción avanzada de tablas con bounding boxes
+- OCR mejorado con 80+ idiomas
+- Detección de estructura basada en coordenadas
+- Fallback a PyMuPDF si OpenDataLoader no disponible
 """
 
-VERSION = "3.0.0"
+VERSION = "3.5.0"
 VERSION_FECHA = "2026-04-07"
 
 import tkinter as tk
@@ -55,7 +62,8 @@ def instalar_dependencias():
         'fitz': 'PyMuPDF',
         'pytesseract': 'pytesseract',
         'PIL': 'Pillow',
-        'pyodbc': 'pyodbc'
+        'pyodbc': 'pyodbc',
+        'opendataloader_pdf': 'opendataloader-pdf'
     }
 
     for modulo, paquete in dependencias.items():
@@ -75,6 +83,14 @@ import fitz
 import pytesseract
 import pyodbc
 from PIL import Image, ImageTk
+
+# OpenDataLoader - con fallback si no está disponible
+try:
+    import opendataloader_pdf
+    OPENDATALOADER_OK = True
+except ImportError:
+    OPENDATALOADER_OK = False
+    print("⚠️ OpenDataLoader no disponible. Usando PyMuPDF como fallback.")
 
 # =============================================================================
 # CONFIGURACIÓN
@@ -666,20 +682,132 @@ class DetectorDocumento:
 
 
 # =============================================================================
-# CLASE: ExtractorConceptos (Extrae conceptos e importes)
+# CLASE: ExtractorConceptos (Extrae conceptos e importes con OpenDataLoader)
 # =============================================================================
 class ExtractorConceptos:
-    """Extrae conceptos e importes de un texto usando patrones"""
+    """
+    Extrae conceptos e importes usando:
+    1. Tablas estructuradas de OpenDataLoader (si disponibles)
+    2. Bounding boxes para localización precisa
+    3. Patrones regex como fallback
+    """
 
     def __init__(self):
         self.logger = Logger()
 
-    def extraer(self, texto, plantilla=None):
+    def extraer(self, texto, plantilla=None, pdf_processor=None):
         """
-        Extrae conceptos e importes del texto.
+        Extrae conceptos e importes del documento.
 
-        Returns: lista de {concepto, importe, linea}
+        Si pdf_processor tiene datos de OpenDataLoader, los usa.
+        De lo contrario, usa extracción por patrones.
+
+        Returns: lista de {concepto, importe, linea, bbox, fuente}
         """
+        # Si tenemos tablas de OpenDataLoader, usarlas primero
+        if pdf_processor and pdf_processor.tablas:
+            resultados = self._extraer_de_tablas(pdf_processor.tablas, plantilla)
+            if resultados:
+                self.logger.info(
+                    f"Extracción desde tablas OpenDataLoader",
+                    f"Encontrados: {len(resultados)} conceptos"
+                )
+                return resultados
+
+        # Fallback: extracción por patrones de texto
+        return self._extraer_por_patrones(texto, plantilla)
+
+    def _extraer_de_tablas(self, tablas, plantilla=None):
+        """Extrae conceptos de tablas estructuradas de OpenDataLoader"""
+        resultados = []
+
+        # Patrones para identificar columnas
+        patron_concepto = r'(CONCEPTO|DESCRIPCIÓN|DEVENGO|DEDUCCIÓN)'
+        patron_importe = r'(IMPORTE|CANTIDAD|TOTAL|EUROS|€)'
+
+        for tabla in tablas:
+            filas = tabla.get('filas', [])
+            if not filas:
+                continue
+
+            # Detectar índices de columnas
+            idx_concepto = None
+            idx_importe = None
+            encabezado = filas[0] if filas else []
+
+            for i, celda in enumerate(encabezado):
+                texto_celda = str(celda).upper()
+                if re.search(patron_concepto, texto_celda):
+                    idx_concepto = i
+                if re.search(patron_importe, texto_celda):
+                    idx_importe = i
+
+            # Si no encontramos encabezados, asumir columnas típicas
+            if idx_concepto is None and len(encabezado) >= 2:
+                idx_concepto = 0
+                idx_importe = len(encabezado) - 1
+
+            # Procesar filas de datos
+            for num_fila, fila in enumerate(filas[1:], start=2):
+                if not fila or len(fila) <= max(idx_concepto or 0, idx_importe or 0):
+                    continue
+
+                concepto = str(fila[idx_concepto]).strip() if idx_concepto is not None else ''
+                importe_str = str(fila[idx_importe]).strip() if idx_importe is not None else ''
+
+                # Verificar que es un concepto válido
+                if not concepto or len(concepto) < 3:
+                    continue
+
+                # Normalizar importe
+                importe = self._normalizar_importe(importe_str)
+
+                # Verificar si el concepto es relevante para nóminas
+                if self._es_concepto_nomina(concepto):
+                    resultados.append({
+                        'concepto': concepto.upper(),
+                        'importe': importe,
+                        'linea': num_fila,
+                        'texto_original': f"{concepto}: {importe_str}",
+                        'bbox': tabla.get('bbox', {}),
+                        'fuente': 'tabla_opendataloader'
+                    })
+
+        return resultados
+
+    def _es_concepto_nomina(self, texto):
+        """Verifica si el texto parece un concepto de nómina"""
+        texto_upper = texto.upper()
+        conceptos_nomina = [
+            'SALARIO', 'SUELDO', 'BASE', 'PLUS', 'COMPLEMENTO',
+            'PRORRATA', 'PAGAS', 'EXTRA', 'HORAS', 'ANTIGÜEDAD',
+            'IRPF', 'I.R.P.F', 'SEGURIDAD', 'SOCIAL', 'CONTINGENCIAS',
+            'DESEMPLEO', 'FORMACIÓN', 'TOTAL', 'LÍQUIDO', 'NETO',
+            'DEVENGO', 'DEDUCCIÓN', 'RETENCIÓN', 'APORTACIÓN',
+            'DIETA', 'TRANSPORTE', 'INCENTIVO', 'COMISIÓN', 'BONUS'
+        ]
+        return any(c in texto_upper for c in conceptos_nomina)
+
+    def _normalizar_importe(self, importe_str):
+        """Normaliza un string de importe a float"""
+        if not importe_str:
+            return None
+        try:
+            # Limpiar caracteres no numéricos excepto . y ,
+            limpio = re.sub(r'[^\d.,\-]', '', importe_str)
+            if not limpio:
+                return None
+            # Normalizar: 1.234,56 -> 1234.56
+            if ',' in limpio and '.' in limpio:
+                limpio = limpio.replace('.', '').replace(',', '.')
+            elif ',' in limpio:
+                limpio = limpio.replace(',', '.')
+            return float(limpio)
+        except:
+            return None
+
+    def _extraer_por_patrones(self, texto, plantilla=None):
+        """Fallback: extracción por patrones regex"""
         resultados = []
         lineas = texto.split('\n')
 
@@ -693,6 +821,9 @@ class ExtractorConceptos:
             r'(ANTIGÜEDAD)',
             r'(I\.?R\.?P\.?F\.?)',
             r'(SEGURIDAD\s+SOCIAL.*)',
+            r'(CONTINGENCIAS\s+COMUNES)',
+            r'(DESEMPLEO)',
+            r'(FORMACIÓN\s+PROFESIONAL)',
             r'(TOTAL\s+DEVENGADO)',
             r'(TOTAL\s+DEDUCCIONES)',
             r'(LÍQUIDO\s*A?\s*PERCIBIR|NETO\s*A?\s*PAGAR)',
@@ -714,26 +845,65 @@ class ExtractorConceptos:
 
                     # Buscar importe en la misma línea
                     match_importe = re.search(patron_importe, linea)
-                    importe = None
-                    if match_importe:
-                        try:
-                            importe_str = match_importe.group(1)
-                            # Normalizar: 1.234,56 -> 1234.56
-                            importe_str = importe_str.replace('.', '').replace(',', '.')
-                            importe = float(importe_str)
-                        except:
-                            pass
+                    importe = self._normalizar_importe(
+                        match_importe.group(1) if match_importe else None
+                    )
 
                     if concepto:
                         resultados.append({
                             'concepto': concepto,
                             'importe': importe,
                             'linea': i + 1,
-                            'texto_original': linea.strip()
+                            'texto_original': linea.strip(),
+                            'bbox': {},
+                            'fuente': 'patron_regex'
                         })
                     break  # Solo un concepto por línea
 
-        self.logger.debug(f"Conceptos extraídos: {len(resultados)}")
+        self.logger.debug(f"Conceptos extraídos por patrones: {len(resultados)}")
+        return resultados
+
+    def extraer_con_bounding_boxes(self, pdf_processor, plantilla=None):
+        """
+        Extracción avanzada usando bounding boxes de OpenDataLoader.
+        Permite encontrar valores asociados a etiquetas por proximidad espacial.
+        """
+        if not pdf_processor or not pdf_processor.elementos:
+            return self.extraer(pdf_processor.texto if pdf_processor else '', plantilla)
+
+        resultados = []
+
+        # Etiquetas a buscar en nóminas
+        etiquetas = [
+            'SALARIO BASE', 'PLUS', 'COMPLEMENTO', 'PRORRATA',
+            'HORAS EXTRA', 'ANTIGÜEDAD', 'IRPF', 'I.R.P.F.',
+            'SEGURIDAD SOCIAL', 'CONTINGENCIAS', 'DESEMPLEO',
+            'TOTAL DEVENGADO', 'TOTAL DEDUCCIONES', 'LÍQUIDO', 'NETO'
+        ]
+
+        for etiqueta in etiquetas:
+            # Buscar elementos cercanos a cada etiqueta
+            cercanos = pdf_processor.buscar_texto_cerca_de(etiqueta, radio=100)
+
+            for elem in cercanos:
+                texto = elem.get('texto', '')
+                importe = self._normalizar_importe(texto)
+
+                if importe is not None:
+                    resultados.append({
+                        'concepto': etiqueta.upper(),
+                        'importe': importe,
+                        'linea': 0,
+                        'texto_original': f"{etiqueta}: {texto}",
+                        'bbox': elem.get('bbox', {}),
+                        'fuente': 'bounding_box'
+                    })
+                    break  # Solo el primer valor cercano
+
+        self.logger.info(
+            f"Extracción con bounding boxes",
+            f"Encontrados: {len(resultados)} conceptos"
+        )
         return resultados
 
     def mapear_a_cuentas(self, conceptos, plantilla):
@@ -1271,19 +1441,31 @@ class DatabaseManager:
 # CLASE: PDFProcessor
 # =============================================================================
 class PDFProcessor:
-    """Procesa archivos PDF con extracción inteligente de datos"""
+    """
+    Procesa archivos PDF con extracción inteligente de datos.
+
+    Utiliza OpenDataLoader PDF (precisión 0.907) como motor principal,
+    con fallback a PyMuPDF + Tesseract si no está disponible.
+    """
 
     def __init__(self, ruta):
         self.ruta = ruta
         self.nombre = os.path.basename(ruta)
         self.doc = fitz.open(ruta)
         self.texto = ""
+        self.texto_markdown = ""  # Formato estructurado
         self.num_paginas = len(self.doc)
         self.cif = None
         self.periodo = None
         self.anno = None
         self.mes = None
         self.tiene_texto_nativo = False
+        self.logger = Logger()
+
+        # Datos estructurados de OpenDataLoader
+        self.elementos = []  # Lista de elementos con bounding boxes
+        self.tablas = []     # Tablas extraídas
+        self.metodo_extraccion = None  # 'opendataloader' o 'pymupdf'
 
     def cerrar(self):
         if self.doc:
@@ -1292,21 +1474,138 @@ class PDFProcessor:
 
     def procesar_automatico(self, callback_progreso=None):
         """
-        Proceso automático completo:
-        1. Intenta extraer texto nativo
-        2. Si no hay texto, ejecuta OCR
+        Proceso automático completo con OpenDataLoader:
+        1. Intenta usar OpenDataLoader PDF (mejor precisión)
+        2. Fallback a PyMuPDF + OCR si OpenDataLoader falla
         3. Detecta CIF y período
+        4. Extrae tablas estructuradas
 
-        Returns: True si el proceso fue exitoso
+        Returns: (True, "OK") si el proceso fue exitoso
         """
-        # Paso 1: Extraer texto nativo
+        if callback_progreso:
+            callback_progreso(0, self.num_paginas, "Iniciando...")
+
+        # Intentar con OpenDataLoader primero (mejor precisión)
+        if OPENDATALOADER_OK:
+            exito = self._procesar_con_opendataloader(callback_progreso)
+            if exito:
+                self.metodo_extraccion = 'opendataloader'
+                self.logger.info(
+                    "PDF procesado con OpenDataLoader",
+                    f"Tablas: {len(self.tablas)}, Elementos: {len(self.elementos)}"
+                )
+            else:
+                self.logger.warning("OpenDataLoader falló, usando fallback PyMuPDF")
+                self._procesar_con_pymupdf(callback_progreso)
+                self.metodo_extraccion = 'pymupdf'
+        else:
+            self._procesar_con_pymupdf(callback_progreso)
+            self.metodo_extraccion = 'pymupdf'
+
+        # Detectar datos
+        self._detectar_cif()
+        self._detectar_periodo()
+
+        return True, "OK"
+
+    def _procesar_con_opendataloader(self, callback_progreso=None):
+        """Procesa el PDF usando OpenDataLoader (precisión 0.907)"""
+        try:
+            import tempfile
+            import shutil
+
+            if callback_progreso:
+                callback_progreso(1, self.num_paginas, "OpenDataLoader...")
+
+            # Crear directorio temporal para output
+            temp_dir = tempfile.mkdtemp(prefix='lector_nominas_')
+
+            try:
+                # Convertir PDF a JSON con bounding boxes
+                opendataloader_pdf.convert(
+                    input_path=[self.ruta],
+                    output_dir=temp_dir,
+                    format="markdown,json"
+                )
+
+                # Leer resultado markdown
+                md_file = Path(temp_dir) / f"{Path(self.ruta).stem}.md"
+                if md_file.exists():
+                    self.texto_markdown = md_file.read_text(encoding='utf-8')
+                    self.texto = self._markdown_a_texto_plano(self.texto_markdown)
+                    self.tiene_texto_nativo = True
+
+                # Leer resultado JSON con bounding boxes
+                json_file = Path(temp_dir) / f"{Path(self.ruta).stem}.json"
+                if json_file.exists():
+                    data = json.loads(json_file.read_text(encoding='utf-8'))
+                    self._procesar_json_opendataloader(data)
+
+                if callback_progreso:
+                    callback_progreso(self.num_paginas, self.num_paginas, "Completado")
+
+                return bool(self.texto.strip())
+
+            finally:
+                # Limpiar directorio temporal
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+        except Exception as e:
+            self.logger.error(f"Error OpenDataLoader: {str(e)}")
+            return False
+
+    def _markdown_a_texto_plano(self, markdown):
+        """Convierte markdown a texto plano preservando estructura"""
+        texto = markdown
+        # Eliminar encabezados markdown pero preservar texto
+        texto = re.sub(r'^#{1,6}\s*', '', texto, flags=re.MULTILINE)
+        # Eliminar énfasis
+        texto = re.sub(r'\*\*([^*]+)\*\*', r'\1', texto)
+        texto = re.sub(r'\*([^*]+)\*', r'\1', texto)
+        # Eliminar links
+        texto = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', texto)
+        return texto
+
+    def _procesar_json_opendataloader(self, data):
+        """Procesa el JSON de OpenDataLoader extrayendo elementos y tablas"""
+        self.elementos = []
+        self.tablas = []
+
+        if isinstance(data, dict):
+            # Procesar páginas
+            pages = data.get('pages', [])
+            for page in pages:
+                # Extraer elementos con bounding boxes
+                for elem in page.get('elements', []):
+                    self.elementos.append({
+                        'tipo': elem.get('type', 'text'),
+                        'texto': elem.get('text', ''),
+                        'bbox': elem.get('bbox', {}),  # {x, y, width, height}
+                        'pagina': page.get('page_number', 1),
+                        'confianza': elem.get('confidence', 1.0)
+                    })
+
+                # Extraer tablas
+                for tabla in page.get('tables', []):
+                    self.tablas.append({
+                        'filas': tabla.get('rows', []),
+                        'bbox': tabla.get('bbox', {}),
+                        'pagina': page.get('page_number', 1),
+                        'num_cols': tabla.get('num_cols', 0),
+                        'num_filas': tabla.get('num_rows', 0)
+                    })
+
+    def _procesar_con_pymupdf(self, callback_progreso=None):
+        """Fallback: procesa el PDF usando PyMuPDF + Tesseract"""
+        # Extraer texto nativo
         self.texto = "\n".join([p.get_text() for p in self.doc])
         self.tiene_texto_nativo = bool(self.texto.strip())
 
-        # Paso 2: Si no hay texto, usar OCR
+        # Si no hay texto, usar OCR
         if not self.tiene_texto_nativo:
             if not TESSERACT_OK:
-                return False, "PDF sin texto y Tesseract no disponible"
+                self.logger.warning("PDF sin texto y Tesseract no disponible")
+                return
 
             try:
                 lang = 'spa' if 'spa' in pytesseract.get_languages() else 'eng'
@@ -1322,12 +1621,7 @@ class PDFProcessor:
                 textos.append(pytesseract.image_to_string(img, lang=lang))
 
             self.texto = "\n".join(textos)
-
-        # Paso 3: Detectar datos
-        self._detectar_cif()
-        self._detectar_periodo()
-
-        return True, "OK"
+            self.tiene_texto_nativo = bool(self.texto.strip())
 
     def _detectar_cif(self):
         """Detecta CIF/NIF en el texto"""
@@ -1374,6 +1668,69 @@ class PDFProcessor:
             pix = self.doc[num_pag].get_pixmap(matrix=fitz.Matrix(zoom, zoom))
             return Image.open(io.BytesIO(pix.tobytes("png")))
         return None
+
+    def get_tablas(self):
+        """Devuelve las tablas extraídas por OpenDataLoader"""
+        return self.tablas
+
+    def get_elementos_por_tipo(self, tipo):
+        """Filtra elementos por tipo (text, table, heading, etc.)"""
+        return [e for e in self.elementos if e['tipo'] == tipo]
+
+    def get_elementos_en_region(self, x, y, ancho, alto, pagina=1):
+        """Obtiene elementos dentro de una región específica (útil para plantillas)"""
+        resultados = []
+        for elem in self.elementos:
+            if elem['pagina'] != pagina:
+                continue
+            bbox = elem.get('bbox', {})
+            ex, ey = bbox.get('x', 0), bbox.get('y', 0)
+            ew, eh = bbox.get('width', 0), bbox.get('height', 0)
+
+            # Verificar si el elemento está dentro de la región
+            if (ex >= x and ey >= y and
+                ex + ew <= x + ancho and ey + eh <= y + alto):
+                resultados.append(elem)
+
+        return resultados
+
+    def buscar_texto_cerca_de(self, texto_buscar, radio=50):
+        """
+        Busca un texto y devuelve elementos cercanos.
+        Útil para encontrar valores asociados a etiquetas.
+        """
+        resultados = []
+        texto_buscar = texto_buscar.upper()
+
+        # Encontrar el elemento con el texto buscado
+        elem_referencia = None
+        for elem in self.elementos:
+            if texto_buscar in elem.get('texto', '').upper():
+                elem_referencia = elem
+                break
+
+        if not elem_referencia:
+            return resultados
+
+        # Buscar elementos cercanos
+        ref_bbox = elem_referencia.get('bbox', {})
+        ref_x = ref_bbox.get('x', 0) + ref_bbox.get('width', 0)
+        ref_y = ref_bbox.get('y', 0)
+
+        for elem in self.elementos:
+            if elem == elem_referencia:
+                continue
+            bbox = elem.get('bbox', {})
+            ex, ey = bbox.get('x', 0), bbox.get('y', 0)
+
+            # Verificar si está cerca (a la derecha o debajo)
+            dist_x = abs(ex - ref_x)
+            dist_y = abs(ey - ref_y)
+
+            if dist_x <= radio and dist_y <= radio:
+                resultados.append(elem)
+
+        return resultados
 
 # =============================================================================
 # CLASE: ZonaArrastre (Drag & Drop visual)
@@ -1745,7 +2102,14 @@ class AplicacionFase3:
                         self.var_periodo.set(self.pdf.periodo or "(No detectado)")
                         self.var_anno.set(str(self.pdf.anno))
                         self.var_mes.set(str(self.pdf.mes))
-                        self.var_metodo.set("Texto nativo" if self.pdf.tiene_texto_nativo else "OCR (imagen)")
+                        # Mostrar método de extracción
+                        if self.pdf.metodo_extraccion == 'opendataloader':
+                            metodo = f"OpenDataLoader (Tablas: {len(self.pdf.tablas)})"
+                        elif self.pdf.tiene_texto_nativo:
+                            metodo = "PyMuPDF (Texto nativo)"
+                        else:
+                            metodo = "PyMuPDF + OCR"
+                        self.var_metodo.set(metodo)
 
                         # Mostrar primera página
                         self.pagina_actual = 0
@@ -1931,8 +2295,10 @@ class AplicacionFase3:
                     self.var_plantilla_confianza.set(f"({score:.0f}% coincidencia)")
                     self.label_confianza.configure(foreground='green' if score > 70 else 'orange')
 
-                    # Extraer conceptos con la plantilla
-                    self.conceptos_extraidos = self.extractor.extraer(self.pdf.texto, plantilla)
+                    # Extraer conceptos con la plantilla (usando OpenDataLoader si disponible)
+                    self.conceptos_extraidos = self.extractor.extraer(
+                        self.pdf.texto, plantilla, self.pdf
+                    )
                     self.conceptos_extraidos = self.extractor.mapear_a_cuentas(
                         self.conceptos_extraidos, plantilla
                     )
@@ -1949,8 +2315,10 @@ class AplicacionFase3:
                     self.var_plantilla_confianza.set("(usar Modo Aprendizaje)")
                     self.label_confianza.configure(foreground='orange')
 
-                    # Extraer conceptos sin plantilla
-                    self.conceptos_extraidos = self.extractor.extraer(self.pdf.texto)
+                    # Extraer conceptos sin plantilla (usando OpenDataLoader si disponible)
+                    self.conceptos_extraidos = self.extractor.extraer(
+                        self.pdf.texto, None, self.pdf
+                    )
 
             self.queue.put(actualizar)
 
