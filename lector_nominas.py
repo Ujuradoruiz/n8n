@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 LECTOR DE NÓMINAS - FASE 1: Fundamentos y Lectura de PDFs
+Versión: 1.1.2
+Fecha: 2026-04-07
 Autor: Claude para Jurado Asesores Tributarios - 2026
 
 FUNCIONALIDADES FASE 1:
@@ -10,6 +12,7 @@ FUNCIONALIDADES FASE 1:
 - OCR automático si no hay texto nativo
 - Detección automática de CIF y período
 - Interfaz intuitiva con mínima interacción
+- Ventana maximizada a pantalla completa
 """
 
 import tkinter as tk
@@ -301,8 +304,16 @@ class AplicacionFase1:
     def __init__(self, root):
         self.root = root
         self.root.title("📄 Lector de Nóminas - Fase 1")
-        self.root.geometry("1000x650")
         self.root.configure(bg='#f5f5f5')
+
+        # Maximizar ventana a pantalla completa
+        if sys.platform == 'win32':
+            self.root.state('zoomed')  # Windows: maximizado
+        else:
+            # Linux/Mac: usar dimensiones de pantalla
+            ancho = self.root.winfo_screenwidth()
+            alto = self.root.winfo_screenheight()
+            self.root.geometry(f"{ancho}x{alto}+0+0")
 
         self.db = DatabaseManager()
         self.pdf = None
