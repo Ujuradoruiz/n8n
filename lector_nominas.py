@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-LECTOR DE NÓMINAS - FASE 2: Integración con Geyce
-Versión: 2.0.0
+LECTOR DE NÓMINAS - FASE 3: Sistema Inteligente de Plantillas
+Versión: 3.0.0
 Fecha: 2026-04-07
 Autor: Claude para Jurado Asesores Tributarios - 2026
 
@@ -20,9 +20,17 @@ FUNCIONALIDADES FASE 2:
 - Búsqueda de empresa por CIF en base de datos Geyce
 - Consulta de plan de cuentas por empresa
 - Obtención de número de asiento
+
+FUNCIONALIDADES FASE 3:
+- Sistema de plantillas con aprendizaje automático
+- Auto-detección del tipo de documento (fingerprint)
+- Modo aprendizaje guiado para nuevos formatos
+- Extracción inteligente de conceptos y importes
+- Mapeo automático a cuentas contables
+- Mejora continua con cada corrección del usuario
 """
 
-VERSION = "2.0.0"
+VERSION = "3.0.0"
 VERSION_FECHA = "2026-04-07"
 
 import tkinter as tk
@@ -32,8 +40,11 @@ import sys
 import re
 import threading
 import io
+import json
+import hashlib
 from datetime import datetime
 from queue import Queue, Empty
+from pathlib import Path
 
 # =============================================================================
 # INSTALACIÓN AUTOMÁTICA DE DEPENDENCIAS
@@ -266,6 +277,755 @@ class VentanaLog(tk.Toplevel):
         if messagebox.askyesno("Confirmar", "¿Limpiar todos los registros del log?"):
             self.logger.limpiar()
             self._cargar_registros()
+
+
+# =============================================================================
+# CLASE: Plantilla (Estructura de datos para plantillas)
+# =============================================================================
+class Plantilla:
+    """Representa una plantilla de extracción de datos"""
+
+    def __init__(self, id_plantilla=None):
+        self.id = id_plantilla or self._generar_id()
+        self.nombre = ""
+        self.descripcion = ""
+        self.fecha_creacion = datetime.now().isoformat()
+        self.fecha_modificacion = datetime.now().isoformat()
+        self.veces_usada = 0
+        self.confianza = 0.0  # 0-100, aumenta con cada uso exitoso
+
+        # Fingerprint para auto-detección
+        self.fingerprints = []  # Palabras clave únicas del documento
+
+        # Patrones de extracción
+        self.patrones = {
+            'cif': [],           # Lista de regex para CIF
+            'periodo': [],       # Lista de regex para período
+            'conceptos': [],     # Lista de patrones para conceptos de nómina
+            'importes': []       # Lista de patrones para importes
+        }
+
+        # Mapeo de conceptos a cuentas contables
+        self.mapeo_cuentas = []  # [{patron, cuenta, tipo_movimiento, descripcion}]
+
+        # Historial de correcciones (para aprendizaje)
+        self.correcciones = []
+
+    def _generar_id(self):
+        """Genera un ID único para la plantilla"""
+        return f"PLT_{datetime.now().strftime('%Y%m%d%H%M%S')}_{hashlib.md5(os.urandom(8)).hexdigest()[:6]}"
+
+    def to_dict(self):
+        """Convierte la plantilla a diccionario para guardar"""
+        return {
+            'id': self.id,
+            'nombre': self.nombre,
+            'descripcion': self.descripcion,
+            'fecha_creacion': self.fecha_creacion,
+            'fecha_modificacion': self.fecha_modificacion,
+            'veces_usada': self.veces_usada,
+            'confianza': self.confianza,
+            'fingerprints': self.fingerprints,
+            'patrones': self.patrones,
+            'mapeo_cuentas': self.mapeo_cuentas,
+            'correcciones': self.correcciones[-50:]  # Últimas 50 correcciones
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        """Crea una plantilla desde un diccionario"""
+        p = cls(data.get('id'))
+        p.nombre = data.get('nombre', '')
+        p.descripcion = data.get('descripcion', '')
+        p.fecha_creacion = data.get('fecha_creacion', '')
+        p.fecha_modificacion = data.get('fecha_modificacion', '')
+        p.veces_usada = data.get('veces_usada', 0)
+        p.confianza = data.get('confianza', 0.0)
+        p.fingerprints = data.get('fingerprints', [])
+        p.patrones = data.get('patrones', {})
+        p.mapeo_cuentas = data.get('mapeo_cuentas', [])
+        p.correcciones = data.get('correcciones', [])
+        return p
+
+    def agregar_fingerprint(self, texto):
+        """Añade un fingerprint si no existe"""
+        texto_norm = texto.strip().upper()
+        if texto_norm and texto_norm not in self.fingerprints:
+            self.fingerprints.append(texto_norm)
+
+    def agregar_mapeo(self, patron, cuenta, tipo='debe', descripcion=''):
+        """Añade una regla de mapeo concepto -> cuenta"""
+        self.mapeo_cuentas.append({
+            'patron': patron,
+            'cuenta': cuenta,
+            'tipo': tipo,  # 'debe' o 'haber'
+            'descripcion': descripcion
+        })
+
+    def registrar_correccion(self, campo, valor_original, valor_corregido):
+        """Registra una corrección del usuario para aprendizaje"""
+        self.correcciones.append({
+            'fecha': datetime.now().isoformat(),
+            'campo': campo,
+            'original': valor_original,
+            'corregido': valor_corregido
+        })
+        self.fecha_modificacion = datetime.now().isoformat()
+
+    def incrementar_uso(self, exito=True):
+        """Incrementa el contador de uso y ajusta confianza"""
+        self.veces_usada += 1
+        if exito:
+            # Aumenta confianza (máximo 100)
+            self.confianza = min(100, self.confianza + (100 - self.confianza) * 0.1)
+        else:
+            # Disminuye confianza
+            self.confianza = max(0, self.confianza - 5)
+
+
+# =============================================================================
+# CLASE: GestorPlantillas (Gestión de plantillas)
+# =============================================================================
+class GestorPlantillas:
+    """Gestiona el almacenamiento y recuperación de plantillas (Singleton)"""
+    _instancia = None
+
+    def __new__(cls):
+        if cls._instancia is None:
+            cls._instancia = super().__new__(cls)
+            cls._instancia._inicializar()
+        return cls._instancia
+
+    def _inicializar(self):
+        """Inicializa el gestor de plantillas"""
+        self.logger = Logger()
+
+        # Directorio para guardar plantillas
+        self.directorio = Path.home() / '.lector_nominas' / 'plantillas'
+        self.directorio.mkdir(parents=True, exist_ok=True)
+
+        # Archivo índice
+        self.archivo_indice = self.directorio / 'indice.json'
+
+        # Cache de plantillas cargadas
+        self._cache = {}
+
+        # Cargar índice
+        self._cargar_indice()
+
+        self.logger.info(f"GestorPlantillas inicializado", f"Directorio: {self.directorio}")
+
+    def _cargar_indice(self):
+        """Carga el índice de plantillas"""
+        self._indice = {}
+        if self.archivo_indice.exists():
+            try:
+                with open(self.archivo_indice, 'r', encoding='utf-8') as f:
+                    self._indice = json.load(f)
+                self.logger.debug(f"Índice cargado: {len(self._indice)} plantillas")
+            except Exception as e:
+                self.logger.error("Error cargando índice de plantillas", str(e))
+
+    def _guardar_indice(self):
+        """Guarda el índice de plantillas"""
+        try:
+            with open(self.archivo_indice, 'w', encoding='utf-8') as f:
+                json.dump(self._indice, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.logger.error("Error guardando índice", str(e))
+
+    def guardar(self, plantilla):
+        """Guarda una plantilla"""
+        try:
+            archivo = self.directorio / f"{plantilla.id}.json"
+            with open(archivo, 'w', encoding='utf-8') as f:
+                json.dump(plantilla.to_dict(), f, ensure_ascii=False, indent=2)
+
+            # Actualizar índice
+            self._indice[plantilla.id] = {
+                'nombre': plantilla.nombre,
+                'fingerprints': plantilla.fingerprints,
+                'confianza': plantilla.confianza,
+                'veces_usada': plantilla.veces_usada
+            }
+            self._guardar_indice()
+
+            # Actualizar cache
+            self._cache[plantilla.id] = plantilla
+
+            self.logger.info(f"Plantilla guardada: {plantilla.nombre}", plantilla.id)
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Error guardando plantilla {plantilla.id}", str(e))
+            return False
+
+    def cargar(self, id_plantilla):
+        """Carga una plantilla por su ID"""
+        # Verificar cache
+        if id_plantilla in self._cache:
+            return self._cache[id_plantilla]
+
+        archivo = self.directorio / f"{id_plantilla}.json"
+        if not archivo.exists():
+            self.logger.warning(f"Plantilla no encontrada: {id_plantilla}")
+            return None
+
+        try:
+            with open(archivo, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            plantilla = Plantilla.from_dict(data)
+            self._cache[id_plantilla] = plantilla
+            return plantilla
+
+        except Exception as e:
+            self.logger.error(f"Error cargando plantilla {id_plantilla}", str(e))
+            return None
+
+    def listar(self):
+        """Lista todas las plantillas disponibles"""
+        return [
+            {'id': k, **v}
+            for k, v in self._indice.items()
+        ]
+
+    def eliminar(self, id_plantilla):
+        """Elimina una plantilla"""
+        try:
+            archivo = self.directorio / f"{id_plantilla}.json"
+            if archivo.exists():
+                archivo.unlink()
+
+            if id_plantilla in self._indice:
+                del self._indice[id_plantilla]
+                self._guardar_indice()
+
+            if id_plantilla in self._cache:
+                del self._cache[id_plantilla]
+
+            self.logger.info(f"Plantilla eliminada: {id_plantilla}")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Error eliminando plantilla", str(e))
+            return False
+
+
+# =============================================================================
+# CLASE: DetectorDocumento (Auto-detección de tipo de documento)
+# =============================================================================
+class DetectorDocumento:
+    """Detecta el tipo de documento y busca plantilla coincidente"""
+
+    # Fingerprints conocidos de programas de nóminas
+    FINGERPRINTS_CONOCIDOS = {
+        'A3NOM': ['A3NOM', 'A3 SOFTWARE', 'A3EQUIPO', 'WOLTERS KLUWER'],
+        'SAGE': ['SAGE', 'SAGE DESPACHOS', 'LOGIC CLASS'],
+        'NOMINAPLUS': ['NOMINAPLUS', 'NOMINA PLUS', 'SAGE NOMINAPLUS'],
+        'CONTAPLUS': ['CONTAPLUS', 'CONTA PLUS'],
+        'SILTRA': ['SILTRA', 'SISTEMA DE LIQUIDACIÓN'],
+        'SEPE': ['SEPE', 'SERVICIO PÚBLICO DE EMPLEO'],
+        'AEAT': ['AGENCIA TRIBUTARIA', 'AEAT', 'MODELO 111', 'MODELO 190'],
+        'SS': ['SEGURIDAD SOCIAL', 'TGSS', 'TESORERÍA GENERAL']
+    }
+
+    def __init__(self):
+        self.logger = Logger()
+        self.gestor = GestorPlantillas()
+
+    def detectar_fingerprints(self, texto):
+        """Extrae fingerprints del texto del documento"""
+        fingerprints = []
+        texto_upper = texto.upper()
+
+        # Buscar fingerprints conocidos
+        for nombre, keywords in self.FINGERPRINTS_CONOCIDOS.items():
+            for kw in keywords:
+                if kw in texto_upper:
+                    fingerprints.append(nombre)
+                    break
+
+        # Extraer otras palabras clave relevantes (empresas de software, etc.)
+        patrones_extra = [
+            r'NÓMINA[S]?\s+DE\s+(\w+)',
+            r'GENERADO\s+(?:POR|CON)\s+(\w+)',
+            r'SOFTWARE\s+(\w+)',
+        ]
+
+        for patron in patrones_extra:
+            matches = re.findall(patron, texto_upper)
+            for m in matches:
+                if len(m) > 3:  # Ignorar palabras muy cortas
+                    fingerprints.append(m)
+
+        return list(set(fingerprints))
+
+    def calcular_similitud(self, fingerprints_doc, fingerprints_plantilla):
+        """Calcula la similitud entre dos conjuntos de fingerprints"""
+        if not fingerprints_doc or not fingerprints_plantilla:
+            return 0.0
+
+        set_doc = set(f.upper() for f in fingerprints_doc)
+        set_plt = set(f.upper() for f in fingerprints_plantilla)
+
+        interseccion = len(set_doc & set_plt)
+        union = len(set_doc | set_plt)
+
+        if union == 0:
+            return 0.0
+
+        return (interseccion / union) * 100
+
+    def buscar_plantilla(self, texto):
+        """
+        Busca la mejor plantilla para el documento.
+
+        Returns: (plantilla, confianza) o (None, 0) si no encuentra
+        """
+        fingerprints_doc = self.detectar_fingerprints(texto)
+        self.logger.debug(f"Fingerprints detectados: {fingerprints_doc}")
+
+        if not fingerprints_doc:
+            self.logger.info("No se detectaron fingerprints en el documento")
+            return None, 0
+
+        mejor_plantilla = None
+        mejor_score = 0
+
+        for info in self.gestor.listar():
+            similitud = self.calcular_similitud(fingerprints_doc, info.get('fingerprints', []))
+
+            # Ponderar por confianza de la plantilla
+            score = similitud * (0.5 + info.get('confianza', 0) / 200)
+
+            if score > mejor_score and score >= 30:  # Umbral mínimo 30%
+                mejor_score = score
+                mejor_plantilla = self.gestor.cargar(info['id'])
+
+        if mejor_plantilla:
+            self.logger.info(
+                f"Plantilla encontrada: {mejor_plantilla.nombre}",
+                f"Score: {mejor_score:.1f}%"
+            )
+        else:
+            self.logger.info("No se encontró plantilla coincidente")
+
+        return mejor_plantilla, mejor_score
+
+    def crear_plantilla_desde_documento(self, texto, nombre="Nueva Plantilla"):
+        """Crea una plantilla base a partir de un documento"""
+        plantilla = Plantilla()
+        plantilla.nombre = nombre
+
+        # Detectar fingerprints
+        fingerprints = self.detectar_fingerprints(texto)
+        for fp in fingerprints:
+            plantilla.agregar_fingerprint(fp)
+
+        # Patrones por defecto para nóminas españolas
+        plantilla.patrones = {
+            'cif': [
+                r'[A-HJ-NP-SUVW]\d{7}[A-J0-9]',
+                r'CIF[:\s]*([A-Z]\d{8})',
+                r'NIF[:\s]*(\d{8}[A-Z])'
+            ],
+            'periodo': [
+                r'(ENERO|FEBRERO|MARZO|ABRIL|MAYO|JUNIO|JULIO|AGOSTO|SEPTIEMBRE|OCTUBRE|NOVIEMBRE|DICIEMBRE)\s*[/-]?\s*(\d{4})',
+                r'PERÍODO[:\s]*(\d{2})[/-](\d{4})',
+                r'MES[:\s]*(\d{1,2})[/-](\d{4})'
+            ],
+            'conceptos': [
+                r'SALARIO\s*BASE',
+                r'PLUS\s+\w+',
+                r'PRORRATA\s+PAGAS',
+                r'HORAS\s+EXTRA',
+                r'COMPLEMENTO\s+\w+',
+                r'ANTIGÜEDAD',
+                r'I\.?R\.?P\.?F\.?',
+                r'SEGURIDAD\s+SOCIAL',
+                r'TOTAL\s+DEVENGADO',
+                r'TOTAL\s+DEDUCCIONES',
+                r'LÍQUIDO|NETO'
+            ],
+            'importes': [
+                r'(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2}))\s*€?',
+            ]
+        }
+
+        # Mapeo básico por defecto
+        plantilla.mapeo_cuentas = [
+            {'patron': 'SALARIO', 'cuenta': '6400000', 'tipo': 'debe', 'descripcion': 'Sueldos y salarios'},
+            {'patron': 'SS.*EMPRESA|SEGURIDAD SOCIAL', 'cuenta': '6420000', 'tipo': 'debe', 'descripcion': 'SS a cargo empresa'},
+            {'patron': 'IRPF|I.R.P.F', 'cuenta': '4751000', 'tipo': 'haber', 'descripcion': 'HP Acreedora IRPF'},
+            {'patron': 'SS.*TRABAJADOR', 'cuenta': '4760000', 'tipo': 'haber', 'descripcion': 'SS a cargo trabajador'},
+            {'patron': 'NETO|LÍQUIDO', 'cuenta': '4650000', 'tipo': 'haber', 'descripcion': 'Remuneraciones pendientes'}
+        ]
+
+        self.logger.info(f"Plantilla creada: {plantilla.nombre}", f"Fingerprints: {fingerprints}")
+        return plantilla
+
+
+# =============================================================================
+# CLASE: ExtractorConceptos (Extrae conceptos e importes)
+# =============================================================================
+class ExtractorConceptos:
+    """Extrae conceptos e importes de un texto usando patrones"""
+
+    def __init__(self):
+        self.logger = Logger()
+
+    def extraer(self, texto, plantilla=None):
+        """
+        Extrae conceptos e importes del texto.
+
+        Returns: lista de {concepto, importe, linea}
+        """
+        resultados = []
+        lineas = texto.split('\n')
+
+        # Patrones por defecto si no hay plantilla
+        patrones_conceptos = [
+            r'(SALARIO\s*BASE)',
+            r'(PLUS\s+\w+)',
+            r'(PRORRATA\s+PAGAS?\s*\w*)',
+            r'(HORAS\s+EXTRA\w*)',
+            r'(COMPLEMENTO\s+\w+)',
+            r'(ANTIGÜEDAD)',
+            r'(I\.?R\.?P\.?F\.?)',
+            r'(SEGURIDAD\s+SOCIAL.*)',
+            r'(TOTAL\s+DEVENGADO)',
+            r'(TOTAL\s+DEDUCCIONES)',
+            r'(LÍQUIDO\s*A?\s*PERCIBIR|NETO\s*A?\s*PAGAR)',
+        ]
+
+        if plantilla and plantilla.patrones.get('conceptos'):
+            patrones_conceptos = plantilla.patrones['conceptos']
+
+        # Patrón para importes
+        patron_importe = r'(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})'
+
+        for i, linea in enumerate(lineas):
+            linea_upper = linea.upper()
+
+            for patron in patrones_conceptos:
+                match_concepto = re.search(patron, linea_upper, re.IGNORECASE)
+                if match_concepto:
+                    concepto = match_concepto.group(1).strip()
+
+                    # Buscar importe en la misma línea
+                    match_importe = re.search(patron_importe, linea)
+                    importe = None
+                    if match_importe:
+                        try:
+                            importe_str = match_importe.group(1)
+                            # Normalizar: 1.234,56 -> 1234.56
+                            importe_str = importe_str.replace('.', '').replace(',', '.')
+                            importe = float(importe_str)
+                        except:
+                            pass
+
+                    if concepto:
+                        resultados.append({
+                            'concepto': concepto,
+                            'importe': importe,
+                            'linea': i + 1,
+                            'texto_original': linea.strip()
+                        })
+                    break  # Solo un concepto por línea
+
+        self.logger.debug(f"Conceptos extraídos: {len(resultados)}")
+        return resultados
+
+    def mapear_a_cuentas(self, conceptos, plantilla):
+        """
+        Mapea conceptos extraídos a cuentas contables.
+
+        Returns: lista de {concepto, importe, cuenta, tipo, descripcion}
+        """
+        if not plantilla or not plantilla.mapeo_cuentas:
+            return conceptos
+
+        resultado = []
+        for item in conceptos:
+            cuenta_asignada = None
+            tipo = 'debe'
+            descripcion = ''
+
+            for mapeo in plantilla.mapeo_cuentas:
+                if re.search(mapeo['patron'], item['concepto'], re.IGNORECASE):
+                    cuenta_asignada = mapeo['cuenta']
+                    tipo = mapeo.get('tipo', 'debe')
+                    descripcion = mapeo.get('descripcion', '')
+                    break
+
+            resultado.append({
+                **item,
+                'cuenta': cuenta_asignada,
+                'tipo': tipo,
+                'descripcion': descripcion
+            })
+
+        return resultado
+
+
+# =============================================================================
+# CLASE: VentanaAprendizaje (Modo aprendizaje interactivo)
+# =============================================================================
+class VentanaAprendizaje(tk.Toplevel):
+    """Ventana para el modo aprendizaje - crear/editar plantillas"""
+
+    def __init__(self, parent, texto_documento, plantilla=None, callback_guardar=None):
+        super().__init__(parent)
+        self.title("Modo Aprendizaje - Crear/Editar Plantilla")
+        self.geometry("1000x700")
+
+        self.texto = texto_documento
+        self.plantilla = plantilla or Plantilla()
+        self.callback_guardar = callback_guardar
+        self.logger = Logger()
+        self.detector = DetectorDocumento()
+        self.extractor = ExtractorConceptos()
+
+        # Extraer datos iniciales
+        self.conceptos_extraidos = self.extractor.extraer(texto_documento, plantilla)
+
+        self._crear_ui()
+        self._cargar_datos()
+
+    def _crear_ui(self):
+        # Notebook con pestañas
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill='both', expand=True, padx=10, pady=10)
+
+        # === Pestaña 1: Información básica ===
+        tab_info = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(tab_info, text="1. Información")
+
+        ttk.Label(tab_info, text="Nombre de la plantilla:", font=('Arial', 10, 'bold')).pack(anchor='w')
+        self.var_nombre = tk.StringVar(value=self.plantilla.nombre)
+        ttk.Entry(tab_info, textvariable=self.var_nombre, font=('Arial', 12), width=50).pack(anchor='w', pady=(0, 15))
+
+        ttk.Label(tab_info, text="Descripción:", font=('Arial', 10, 'bold')).pack(anchor='w')
+        self.txt_descripcion = tk.Text(tab_info, height=3, font=('Arial', 10))
+        self.txt_descripcion.pack(fill='x', pady=(0, 15))
+        self.txt_descripcion.insert('1.0', self.plantilla.descripcion)
+
+        ttk.Label(tab_info, text="Fingerprints (palabras clave para detectar este tipo de documento):",
+                 font=('Arial', 10, 'bold')).pack(anchor='w')
+
+        frame_fp = ttk.Frame(tab_info)
+        frame_fp.pack(fill='x', pady=(0, 10))
+
+        self.var_fingerprint = tk.StringVar()
+        ttk.Entry(frame_fp, textvariable=self.var_fingerprint, width=30).pack(side='left')
+        ttk.Button(frame_fp, text="+ Añadir", command=self._agregar_fingerprint).pack(side='left', padx=5)
+        ttk.Button(frame_fp, text="Auto-detectar", command=self._autodetectar_fingerprints).pack(side='left')
+
+        self.lista_fingerprints = tk.Listbox(tab_info, height=5, font=('Consolas', 10))
+        self.lista_fingerprints.pack(fill='x')
+        self.lista_fingerprints.bind('<Delete>', lambda e: self._eliminar_fingerprint())
+
+        # === Pestaña 2: Conceptos extraídos ===
+        tab_conceptos = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(tab_conceptos, text="2. Conceptos")
+
+        ttk.Label(tab_conceptos, text="Conceptos detectados en el documento:",
+                 font=('Arial', 10, 'bold')).pack(anchor='w')
+        ttk.Label(tab_conceptos, text="(Marque los que desea incluir en la plantilla)",
+                 foreground='gray').pack(anchor='w')
+
+        frame_conceptos = ttk.Frame(tab_conceptos)
+        frame_conceptos.pack(fill='both', expand=True, pady=10)
+
+        # Treeview para conceptos
+        columnas = ('sel', 'concepto', 'importe', 'cuenta', 'tipo')
+        self.tree_conceptos = ttk.Treeview(frame_conceptos, columns=columnas, show='headings', height=15)
+        self.tree_conceptos.heading('sel', text='✓')
+        self.tree_conceptos.heading('concepto', text='Concepto')
+        self.tree_conceptos.heading('importe', text='Importe')
+        self.tree_conceptos.heading('cuenta', text='Cuenta')
+        self.tree_conceptos.heading('tipo', text='Tipo')
+
+        self.tree_conceptos.column('sel', width=30, anchor='center')
+        self.tree_conceptos.column('concepto', width=300)
+        self.tree_conceptos.column('importe', width=100, anchor='e')
+        self.tree_conceptos.column('cuenta', width=100, anchor='center')
+        self.tree_conceptos.column('tipo', width=80, anchor='center')
+
+        scroll = ttk.Scrollbar(frame_conceptos, orient='vertical', command=self.tree_conceptos.yview)
+        self.tree_conceptos.configure(yscrollcommand=scroll.set)
+        scroll.pack(side='right', fill='y')
+        self.tree_conceptos.pack(fill='both', expand=True)
+
+        # Doble clic para editar
+        self.tree_conceptos.bind('<Double-1>', self._editar_concepto)
+
+        # === Pestaña 3: Mapeo de cuentas ===
+        tab_mapeo = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(tab_mapeo, text="3. Mapeo Cuentas")
+
+        ttk.Label(tab_mapeo, text="Reglas de mapeo concepto → cuenta contable:",
+                 font=('Arial', 10, 'bold')).pack(anchor='w')
+
+        frame_nuevo_mapeo = ttk.LabelFrame(tab_mapeo, text="Añadir regla", padding=10)
+        frame_nuevo_mapeo.pack(fill='x', pady=10)
+
+        frame_r1 = ttk.Frame(frame_nuevo_mapeo)
+        frame_r1.pack(fill='x', pady=2)
+        ttk.Label(frame_r1, text="Patrón (regex):", width=15).pack(side='left')
+        self.var_mapeo_patron = tk.StringVar()
+        ttk.Entry(frame_r1, textvariable=self.var_mapeo_patron, width=40).pack(side='left', padx=5)
+
+        frame_r2 = ttk.Frame(frame_nuevo_mapeo)
+        frame_r2.pack(fill='x', pady=2)
+        ttk.Label(frame_r2, text="Cuenta:", width=15).pack(side='left')
+        self.var_mapeo_cuenta = tk.StringVar()
+        ttk.Entry(frame_r2, textvariable=self.var_mapeo_cuenta, width=15).pack(side='left', padx=5)
+        ttk.Label(frame_r2, text="Tipo:").pack(side='left', padx=(20, 5))
+        self.var_mapeo_tipo = tk.StringVar(value='debe')
+        ttk.Combobox(frame_r2, textvariable=self.var_mapeo_tipo,
+                    values=['debe', 'haber'], width=10, state='readonly').pack(side='left')
+
+        frame_r3 = ttk.Frame(frame_nuevo_mapeo)
+        frame_r3.pack(fill='x', pady=2)
+        ttk.Label(frame_r3, text="Descripción:", width=15).pack(side='left')
+        self.var_mapeo_desc = tk.StringVar()
+        ttk.Entry(frame_r3, textvariable=self.var_mapeo_desc, width=40).pack(side='left', padx=5)
+        ttk.Button(frame_r3, text="+ Añadir regla", command=self._agregar_mapeo).pack(side='right')
+
+        # Lista de mapeos
+        self.tree_mapeo = ttk.Treeview(tab_mapeo, columns=('patron', 'cuenta', 'tipo', 'desc'),
+                                       show='headings', height=10)
+        self.tree_mapeo.heading('patron', text='Patrón')
+        self.tree_mapeo.heading('cuenta', text='Cuenta')
+        self.tree_mapeo.heading('tipo', text='Tipo')
+        self.tree_mapeo.heading('desc', text='Descripción')
+        self.tree_mapeo.column('patron', width=250)
+        self.tree_mapeo.column('cuenta', width=100)
+        self.tree_mapeo.column('tipo', width=80)
+        self.tree_mapeo.column('desc', width=200)
+        self.tree_mapeo.pack(fill='both', expand=True, pady=10)
+        self.tree_mapeo.bind('<Delete>', lambda e: self._eliminar_mapeo())
+
+        # === Botones inferiores ===
+        frame_botones = ttk.Frame(self)
+        frame_botones.pack(fill='x', padx=10, pady=10)
+
+        ttk.Button(frame_botones, text="Cancelar", command=self.destroy).pack(side='right', padx=5)
+        ttk.Button(frame_botones, text="💾 Guardar Plantilla", command=self._guardar).pack(side='right')
+
+        # Info de la plantilla
+        if self.plantilla.veces_usada > 0:
+            ttk.Label(frame_botones,
+                     text=f"Usada {self.plantilla.veces_usada} veces | Confianza: {self.plantilla.confianza:.0f}%",
+                     foreground='gray').pack(side='left')
+
+    def _cargar_datos(self):
+        """Carga los datos de la plantilla en la UI"""
+        # Fingerprints
+        for fp in self.plantilla.fingerprints:
+            self.lista_fingerprints.insert('end', fp)
+
+        # Conceptos extraídos con mapeo
+        conceptos_mapeados = self.extractor.mapear_a_cuentas(self.conceptos_extraidos, self.plantilla)
+        for item in conceptos_mapeados:
+            importe_str = f"{item['importe']:.2f} €" if item['importe'] else "-"
+            self.tree_conceptos.insert('', 'end', values=(
+                '✓',
+                item['concepto'],
+                importe_str,
+                item.get('cuenta', '-'),
+                item.get('tipo', '-')
+            ))
+
+        # Mapeos existentes
+        for mapeo in self.plantilla.mapeo_cuentas:
+            self.tree_mapeo.insert('', 'end', values=(
+                mapeo['patron'],
+                mapeo['cuenta'],
+                mapeo.get('tipo', 'debe'),
+                mapeo.get('descripcion', '')
+            ))
+
+    def _agregar_fingerprint(self):
+        fp = self.var_fingerprint.get().strip().upper()
+        if fp and fp not in self.lista_fingerprints.get(0, 'end'):
+            self.lista_fingerprints.insert('end', fp)
+            self.var_fingerprint.set('')
+
+    def _eliminar_fingerprint(self):
+        sel = self.lista_fingerprints.curselection()
+        if sel:
+            self.lista_fingerprints.delete(sel[0])
+
+    def _autodetectar_fingerprints(self):
+        fps = self.detector.detectar_fingerprints(self.texto)
+        for fp in fps:
+            if fp not in self.lista_fingerprints.get(0, 'end'):
+                self.lista_fingerprints.insert('end', fp)
+
+    def _agregar_mapeo(self):
+        patron = self.var_mapeo_patron.get().strip()
+        cuenta = self.var_mapeo_cuenta.get().strip()
+        if patron and cuenta:
+            self.tree_mapeo.insert('', 'end', values=(
+                patron,
+                cuenta,
+                self.var_mapeo_tipo.get(),
+                self.var_mapeo_desc.get()
+            ))
+            self.var_mapeo_patron.set('')
+            self.var_mapeo_cuenta.set('')
+            self.var_mapeo_desc.set('')
+
+    def _eliminar_mapeo(self):
+        sel = self.tree_mapeo.selection()
+        if sel:
+            self.tree_mapeo.delete(sel[0])
+
+    def _editar_concepto(self, event):
+        """Permite editar un concepto con doble clic"""
+        item = self.tree_conceptos.selection()
+        if not item:
+            return
+        # TODO: Implementar edición inline o diálogo
+
+    def _guardar(self):
+        """Guarda la plantilla"""
+        # Actualizar datos de la plantilla
+        self.plantilla.nombre = self.var_nombre.get().strip()
+        if not self.plantilla.nombre:
+            messagebox.showwarning("Aviso", "Debe indicar un nombre para la plantilla")
+            return
+
+        self.plantilla.descripcion = self.txt_descripcion.get('1.0', 'end').strip()
+
+        # Fingerprints
+        self.plantilla.fingerprints = list(self.lista_fingerprints.get(0, 'end'))
+
+        # Mapeos
+        self.plantilla.mapeo_cuentas = []
+        for item in self.tree_mapeo.get_children():
+            vals = self.tree_mapeo.item(item, 'values')
+            self.plantilla.mapeo_cuentas.append({
+                'patron': vals[0],
+                'cuenta': vals[1],
+                'tipo': vals[2],
+                'descripcion': vals[3]
+            })
+
+        self.plantilla.fecha_modificacion = datetime.now().isoformat()
+
+        # Guardar
+        gestor = GestorPlantillas()
+        if gestor.guardar(self.plantilla):
+            self.logger.info(f"Plantilla guardada: {self.plantilla.nombre}")
+            messagebox.showinfo("Éxito", f"Plantilla '{self.plantilla.nombre}' guardada correctamente")
+            if self.callback_guardar:
+                self.callback_guardar(self.plantilla)
+            self.destroy()
+        else:
+            messagebox.showerror("Error", "No se pudo guardar la plantilla")
 
 
 # =============================================================================
@@ -678,10 +1438,10 @@ class ZonaArrastre(tk.Canvas):
             self.comando(ruta)
 
 # =============================================================================
-# APLICACIÓN PRINCIPAL - FASE 2
+# APLICACIÓN PRINCIPAL - FASE 3
 # =============================================================================
-class AplicacionFase2:
-    """Interfaz con integración Geyce y sistema de logging"""
+class AplicacionFase3:
+    """Interfaz con sistema inteligente de plantillas y aprendizaje"""
 
     def __init__(self, root):
         self.root = root
@@ -697,10 +1457,18 @@ class AplicacionFase2:
             alto = self.root.winfo_screenheight()
             self.root.geometry(f"{ancho}x{alto}+0+0")
 
+        # Componentes principales
         self.db = DatabaseManager()
         self.logger = Logger()
+        self.gestor_plantillas = GestorPlantillas()
+        self.detector = DetectorDocumento()
+        self.extractor = ExtractorConceptos()
+
+        # Estado
         self.pdf = None
         self.empresa_actual = None
+        self.plantilla_actual = None
+        self.conceptos_extraidos = []
         self.imagen_tk = None
         self.queue = Queue()
 
@@ -709,7 +1477,7 @@ class AplicacionFase2:
         self._procesar_cola()
         self._actualizar_contador_errores()
 
-        self.logger.info("Aplicación iniciada", f"Versión {VERSION}")
+        self.logger.info("Aplicación iniciada", f"Versión {VERSION} - Fase 3")
 
     def _procesar_cola(self):
         try:
@@ -889,6 +1657,31 @@ class AplicacionFase2:
         ttk.Button(frame_acciones, text="📊 Ver Plan Cuentas", command=self._ver_plan_cuentas).pack(side='left', padx=(0, 5))
         ttk.Button(frame_acciones, text="🔄 Actualizar Asiento", command=self._actualizar_asiento).pack(side='left')
 
+        # === PANEL PLANTILLAS (Fase 3) ===
+        frame_plantillas = ttk.LabelFrame(frame_derecho, text=" 4. Plantilla ", padding=10)
+        frame_plantillas.pack(fill='x', pady=(10, 0))
+
+        # Info de plantilla detectada
+        self.var_plantilla_nombre = tk.StringVar(value="(Sin detectar)")
+        frame_plt_info = ttk.Frame(frame_plantillas)
+        frame_plt_info.pack(fill='x')
+        ttk.Label(frame_plt_info, text="Plantilla:", font=('Arial', 10, 'bold')).pack(side='left')
+        ttk.Label(frame_plt_info, textvariable=self.var_plantilla_nombre,
+                 font=('Arial', 10)).pack(side='left', padx=5)
+
+        self.var_plantilla_confianza = tk.StringVar(value="")
+        self.label_confianza = ttk.Label(frame_plt_info, textvariable=self.var_plantilla_confianza,
+                                         font=('Arial', 9), foreground='gray')
+        self.label_confianza.pack(side='left', padx=5)
+
+        # Botones de plantilla
+        frame_plt_btns = ttk.Frame(frame_plantillas)
+        frame_plt_btns.pack(fill='x', pady=(10, 0))
+        ttk.Button(frame_plt_btns, text="🎓 Modo Aprendizaje",
+                  command=self._abrir_modo_aprendizaje).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_plt_btns, text="📋 Ver Plantillas",
+                  command=self._ver_plantillas).pack(side='left')
+
         # === BARRA INFERIOR ===
         frame_bottom = ttk.Frame(main)
         frame_bottom.pack(fill='x', pady=(10, 0))
@@ -896,7 +1689,7 @@ class AplicacionFase2:
         self.label_bd = ttk.Label(frame_bottom, text="BD: Verificando...", foreground='gray')
         self.label_bd.pack(side='left')
 
-        ttk.Label(frame_bottom, text=f"Fase 2 - Integración Geyce | v{VERSION}", foreground='gray').pack(side='right')
+        ttk.Label(frame_bottom, text=f"Fase 3 - Sistema Inteligente | v{VERSION}", foreground='gray').pack(side='right')
 
         # Variables de estado
         self.pagina_actual = 0
@@ -966,6 +1759,9 @@ class AplicacionFase2:
                         # Buscar empresa automáticamente si hay CIF
                         if self.pdf.cif:
                             self._buscar_empresa()
+
+                        # Detectar plantilla automáticamente
+                        self._detectar_plantilla()
                     else:
                         self.var_estado_carga.set(f"❌ Error: {msg}")
                         self.logger.error(f"Error procesando PDF: {self.pdf.nombre}", msg)
@@ -1120,12 +1916,142 @@ class AplicacionFase2:
         texto.insert('1.0', self.pdf.texto)
         texto.configure(state='disabled')
 
+    def _detectar_plantilla(self):
+        """Detecta automáticamente la plantilla para el documento"""
+        if not self.pdf or not self.pdf.texto:
+            return
+
+        def detectar():
+            plantilla, score = self.detector.buscar_plantilla(self.pdf.texto)
+
+            def actualizar():
+                if plantilla:
+                    self.plantilla_actual = plantilla
+                    self.var_plantilla_nombre.set(f"✅ {plantilla.nombre}")
+                    self.var_plantilla_confianza.set(f"({score:.0f}% coincidencia)")
+                    self.label_confianza.configure(foreground='green' if score > 70 else 'orange')
+
+                    # Extraer conceptos con la plantilla
+                    self.conceptos_extraidos = self.extractor.extraer(self.pdf.texto, plantilla)
+                    self.conceptos_extraidos = self.extractor.mapear_a_cuentas(
+                        self.conceptos_extraidos, plantilla
+                    )
+
+                    # Incrementar uso de plantilla
+                    plantilla.incrementar_uso(True)
+                    self.gestor_plantillas.guardar(plantilla)
+
+                    self.logger.info(f"Plantilla aplicada: {plantilla.nombre}",
+                                   f"Conceptos extraídos: {len(self.conceptos_extraidos)}")
+                else:
+                    self.plantilla_actual = None
+                    self.var_plantilla_nombre.set("⚠️ No detectada")
+                    self.var_plantilla_confianza.set("(usar Modo Aprendizaje)")
+                    self.label_confianza.configure(foreground='orange')
+
+                    # Extraer conceptos sin plantilla
+                    self.conceptos_extraidos = self.extractor.extraer(self.pdf.texto)
+
+            self.queue.put(actualizar)
+
+        threading.Thread(target=detectar, daemon=True).start()
+
+    def _abrir_modo_aprendizaje(self):
+        """Abre la ventana de modo aprendizaje"""
+        if not self.pdf or not self.pdf.texto:
+            messagebox.showwarning("Aviso", "Primero debe cargar un PDF")
+            return
+
+        def on_guardar(plantilla):
+            """Callback cuando se guarda la plantilla"""
+            self.plantilla_actual = plantilla
+            self.var_plantilla_nombre.set(f"✅ {plantilla.nombre}")
+            self.var_plantilla_confianza.set("(recién creada)")
+            self.label_confianza.configure(foreground='blue')
+
+        VentanaAprendizaje(
+            self.root,
+            self.pdf.texto,
+            self.plantilla_actual,
+            callback_guardar=on_guardar
+        )
+
+    def _ver_plantillas(self):
+        """Muestra la lista de plantillas disponibles"""
+        plantillas = self.gestor_plantillas.listar()
+
+        ventana = tk.Toplevel(self.root)
+        ventana.title("Plantillas Disponibles")
+        ventana.geometry("700x400")
+
+        frame = ttk.Frame(ventana, padding=10)
+        frame.pack(fill='both', expand=True)
+
+        ttk.Label(frame, text="Plantillas guardadas:", font=('Arial', 12, 'bold')).pack(anchor='w')
+
+        if not plantillas:
+            ttk.Label(frame, text="No hay plantillas guardadas.\nUse el Modo Aprendizaje para crear una.",
+                     foreground='gray').pack(pady=20)
+            return
+
+        # Treeview
+        columnas = ('nombre', 'fingerprints', 'confianza', 'usos')
+        tree = ttk.Treeview(frame, columns=columnas, show='headings', height=15)
+        tree.heading('nombre', text='Nombre')
+        tree.heading('fingerprints', text='Fingerprints')
+        tree.heading('confianza', text='Confianza')
+        tree.heading('usos', text='Usos')
+
+        tree.column('nombre', width=200)
+        tree.column('fingerprints', width=250)
+        tree.column('confianza', width=80, anchor='center')
+        tree.column('usos', width=60, anchor='center')
+
+        scroll = ttk.Scrollbar(frame, orient='vertical', command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+
+        for p in plantillas:
+            fps = ', '.join(p.get('fingerprints', [])[:3])
+            if len(p.get('fingerprints', [])) > 3:
+                fps += '...'
+            tree.insert('', 'end', iid=p['id'], values=(
+                p.get('nombre', 'Sin nombre'),
+                fps,
+                f"{p.get('confianza', 0):.0f}%",
+                p.get('veces_usada', 0)
+            ))
+
+        scroll.pack(side='right', fill='y')
+        tree.pack(fill='both', expand=True)
+
+        # Botones
+        frame_btns = ttk.Frame(frame)
+        frame_btns.pack(fill='x', pady=(10, 0))
+
+        def eliminar():
+            sel = tree.selection()
+            if sel and messagebox.askyesno("Confirmar", "¿Eliminar la plantilla seleccionada?"):
+                self.gestor_plantillas.eliminar(sel[0])
+                tree.delete(sel[0])
+
+        def editar():
+            sel = tree.selection()
+            if sel:
+                plantilla = self.gestor_plantillas.cargar(sel[0])
+                if plantilla:
+                    VentanaAprendizaje(self.root, self.pdf.texto if self.pdf else "", plantilla)
+
+        ttk.Button(frame_btns, text="✏️ Editar", command=editar).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_btns, text="🗑️ Eliminar", command=eliminar).pack(side='left')
+        ttk.Button(frame_btns, text="Cerrar", command=ventana.destroy).pack(side='right')
+
+
 # =============================================================================
 # PUNTO DE ENTRADA
 # =============================================================================
 def main():
     root = tk.Tk()
-    app = AplicacionFase2(root)
+    app = AplicacionFase3(root)
     root.mainloop()
 
 if __name__ == "__main__":
