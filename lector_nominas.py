@@ -52,7 +52,7 @@ FUNCIONALIDADES FASE 5:
 - Panel de alertas y advertencias en tiempo real
 - Informe de validación exportable
 
-FUNCIONALIDADES FASE 6 (NUEVA):
+FUNCIONALIDADES FASE 6:
 - Generación automática de asientos contables
 - Estructura completa: cabecera + líneas de apunte
 - Ventana de previsualización y edición de asientos
@@ -60,9 +60,18 @@ FUNCIONALIDADES FASE 6 (NUEVA):
 - Cuadre automático del asiento
 - Soporte para múltiples líneas por concepto
 - Exportación de asiento a formato texto
+
+FUNCIONALIDADES FASE 7 (NUEVA):
+- Sistema de informes y estadísticas
+- Dashboard con métricas de procesamiento
+- Histórico de asientos generados con búsqueda
+- Configuración personalizable persistente (JSON)
+- Personalización de cuentas contables por defecto
+- Configuración de conexión a base de datos
+- Exportación de informes a PDF/Excel
 """
 
-VERSION = "6.0.0"
+VERSION = "7.0.0"
 VERSION_FECHA = "2026-04-08"
 
 import tkinter as tk
@@ -1211,6 +1220,479 @@ class GeneradorAsientos:
         )
 
         return asiento
+
+
+# =============================================================================
+# CLASE: Configuracion (Configuración persistente)
+# =============================================================================
+class Configuracion:
+    """
+    Gestiona la configuración de la aplicación con persistencia en JSON.
+    Implementa patrón Singleton.
+    """
+    _instancia = None
+    CONFIG_DIR = Path.home() / '.lector_nominas'
+    CONFIG_FILE = CONFIG_DIR / 'config.json'
+
+    # Configuración por defecto
+    DEFAULTS = {
+        'version': '7.0.0',
+        'base_datos': {
+            'server': 'Srvv01',
+            'user': 'sa',
+            'password': '1Geyce$2025!!',
+            'database_geyce': 'GEYCE_Avansa',
+            'database_easp': 'easp'
+        },
+        'cuentas_defecto': {
+            'sueldos': '6400000',
+            'complementos': '6400001',
+            'ss_empresa': '6420000',
+            'irpf': '4751000',
+            'ss_trabajador': '4760000',
+            'neto_pagar': '4650000',
+            'banco': '5720000'
+        },
+        'validaciones': {
+            'smi_mensual': 1134.00,
+            'tolerancia_cuadre': 0.01,
+            'max_salario': 15000.00,
+            'min_salario': 800.00
+        },
+        'interfaz': {
+            'tema': 'claro',
+            'maximizar_inicio': True,
+            'mostrar_tooltips': True,
+            'auto_validar': True,
+            'idioma_ocr': 'spa'
+        },
+        'rutas': {
+            'ultima_carpeta': '',
+            'exportaciones': str(Path.home() / 'Documents'),
+            'plantillas': str(CONFIG_DIR / 'plantillas')
+        },
+        'historico': {
+            'max_registros': 1000,
+            'auto_guardar': True
+        }
+    }
+
+    def __new__(cls):
+        if cls._instancia is None:
+            cls._instancia = super().__new__(cls)
+            cls._instancia._config = None
+            cls._instancia.logger = Logger()
+            cls._instancia._cargar()
+        return cls._instancia
+
+    def _cargar(self):
+        """Carga la configuración desde archivo"""
+        try:
+            self.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+            if self.CONFIG_FILE.exists():
+                with open(self.CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    self._config = json.load(f)
+                # Merge con defaults para nuevas opciones
+                self._config = self._merge_defaults(self._config, self.DEFAULTS)
+                self.logger.debug("Configuración cargada desde archivo")
+            else:
+                self._config = self.DEFAULTS.copy()
+                self._guardar()
+                self.logger.info("Configuración inicial creada")
+
+        except Exception as e:
+            self.logger.error(f"Error cargando configuración: {e}")
+            self._config = self.DEFAULTS.copy()
+
+    def _merge_defaults(self, config, defaults):
+        """Mezcla configuración con defaults para nuevas opciones"""
+        resultado = defaults.copy()
+        for key, value in config.items():
+            if key in resultado:
+                if isinstance(value, dict) and isinstance(resultado[key], dict):
+                    resultado[key] = self._merge_defaults(value, resultado[key])
+                else:
+                    resultado[key] = value
+        return resultado
+
+    def _guardar(self):
+        """Guarda la configuración en archivo"""
+        try:
+            self.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(self.CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self._config, f, indent=2, ensure_ascii=False)
+            self.logger.debug("Configuración guardada")
+            return True
+        except Exception as e:
+            self.logger.error(f"Error guardando configuración: {e}")
+            return False
+
+    def get(self, seccion, clave=None, default=None):
+        """Obtiene un valor de configuración"""
+        if seccion not in self._config:
+            return default
+
+        if clave is None:
+            return self._config[seccion]
+
+        return self._config[seccion].get(clave, default)
+
+    def set(self, seccion, clave, valor):
+        """Establece un valor de configuración"""
+        if seccion not in self._config:
+            self._config[seccion] = {}
+        self._config[seccion][clave] = valor
+        self._guardar()
+
+    def get_cuenta(self, tipo):
+        """Obtiene una cuenta contable por defecto"""
+        return self.get('cuentas_defecto', tipo, '')
+
+    def set_cuenta(self, tipo, cuenta):
+        """Establece una cuenta contable por defecto"""
+        self.set('cuentas_defecto', tipo, cuenta)
+
+    def get_db_config(self):
+        """Obtiene la configuración de base de datos"""
+        return self.get('base_datos')
+
+    def to_dict(self):
+        """Devuelve toda la configuración como diccionario"""
+        return self._config.copy()
+
+    def restaurar_defaults(self):
+        """Restaura la configuración por defecto"""
+        self._config = self.DEFAULTS.copy()
+        self._guardar()
+        self.logger.info("Configuración restaurada a valores por defecto")
+
+
+# =============================================================================
+# CLASE: HistoricoAsientos (Registro de asientos procesados)
+# =============================================================================
+class HistoricoAsientos:
+    """
+    Mantiene un histórico de asientos generados y guardados.
+    Persistencia en archivo JSON.
+    """
+    _instancia = None
+    HISTORICO_FILE = Configuracion.CONFIG_DIR / 'historico_asientos.json'
+
+    def __new__(cls):
+        if cls._instancia is None:
+            cls._instancia = super().__new__(cls)
+            cls._instancia._registros = []
+            cls._instancia.logger = Logger()
+            cls._instancia.config = Configuracion()
+            cls._instancia._cargar()
+        return cls._instancia
+
+    def _cargar(self):
+        """Carga el histórico desde archivo"""
+        try:
+            if self.HISTORICO_FILE.exists():
+                with open(self.HISTORICO_FILE, 'r', encoding='utf-8') as f:
+                    self._registros = json.load(f)
+                self.logger.debug(f"Histórico cargado: {len(self._registros)} registros")
+        except Exception as e:
+            self.logger.error(f"Error cargando histórico: {e}")
+            self._registros = []
+
+    def _guardar(self):
+        """Guarda el histórico en archivo"""
+        try:
+            # Limitar número de registros
+            max_reg = self.config.get('historico', 'max_registros', 1000)
+            if len(self._registros) > max_reg:
+                self._registros = self._registros[-max_reg:]
+
+            Configuracion.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(self.HISTORICO_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self._registros, f, indent=2, ensure_ascii=False)
+            return True
+        except Exception as e:
+            self.logger.error(f"Error guardando histórico: {e}")
+            return False
+
+    def registrar(self, asiento, guardado_bd=False):
+        """Registra un asiento en el histórico"""
+        registro = {
+            'id': hashlib.md5(f"{asiento.numero_asiento}{datetime.now().isoformat()}".encode()).hexdigest()[:12],
+            'fecha_registro': datetime.now().isoformat(),
+            'numero_asiento': asiento.numero_asiento,
+            'fecha_asiento': asiento.fecha.strftime("%Y-%m-%d"),
+            'periodo': asiento.periodo,
+            'empresa': asiento.nombre_empresa,
+            'cif': asiento.cif_empresa,
+            'codigo_empresa': asiento.codigo_empresa,
+            'base_datos': asiento.base_datos,
+            'concepto': asiento.concepto_general,
+            'documento': asiento.documento,
+            'total_debe': asiento.total_debe,
+            'total_haber': asiento.total_haber,
+            'num_lineas': len(asiento.lineas),
+            'cuadrado': asiento.cuadrado,
+            'guardado_bd': guardado_bd
+        }
+
+        self._registros.append(registro)
+
+        if self.config.get('historico', 'auto_guardar', True):
+            self._guardar()
+
+        self.logger.info(f"Asiento registrado en histórico: {registro['id']}")
+        return registro['id']
+
+    def buscar(self, filtros=None):
+        """
+        Busca registros en el histórico.
+
+        Filtros disponibles:
+        - empresa: nombre parcial de empresa
+        - cif: CIF de empresa
+        - periodo: período de nómina
+        - fecha_desde: fecha mínima (YYYY-MM-DD)
+        - fecha_hasta: fecha máxima (YYYY-MM-DD)
+        - guardado_bd: True/False
+        """
+        resultados = self._registros.copy()
+
+        if not filtros:
+            return resultados
+
+        if filtros.get('empresa'):
+            texto = filtros['empresa'].upper()
+            resultados = [r for r in resultados if texto in r.get('empresa', '').upper()]
+
+        if filtros.get('cif'):
+            cif = filtros['cif'].upper().replace(' ', '').replace('-', '')
+            resultados = [r for r in resultados if cif in r.get('cif', '').upper()]
+
+        if filtros.get('periodo'):
+            texto = filtros['periodo'].upper()
+            resultados = [r for r in resultados if texto in r.get('periodo', '').upper()]
+
+        if filtros.get('fecha_desde'):
+            fecha_min = filtros['fecha_desde']
+            resultados = [r for r in resultados if r.get('fecha_asiento', '') >= fecha_min]
+
+        if filtros.get('fecha_hasta'):
+            fecha_max = filtros['fecha_hasta']
+            resultados = [r for r in resultados if r.get('fecha_asiento', '') <= fecha_max]
+
+        if filtros.get('guardado_bd') is not None:
+            guardado = filtros['guardado_bd']
+            resultados = [r for r in resultados if r.get('guardado_bd') == guardado]
+
+        return resultados
+
+    def obtener_por_id(self, id_registro):
+        """Obtiene un registro por su ID"""
+        for r in self._registros:
+            if r.get('id') == id_registro:
+                return r
+        return None
+
+    def eliminar(self, id_registro):
+        """Elimina un registro del histórico"""
+        self._registros = [r for r in self._registros if r.get('id') != id_registro]
+        self._guardar()
+
+    def limpiar(self):
+        """Limpia todo el histórico"""
+        self._registros = []
+        self._guardar()
+
+    def get_estadisticas(self):
+        """Obtiene estadísticas del histórico"""
+        if not self._registros:
+            return {
+                'total_registros': 0,
+                'guardados_bd': 0,
+                'total_debe': 0,
+                'total_haber': 0,
+                'empresas_unicas': 0,
+                'periodos_unicos': 0
+            }
+
+        return {
+            'total_registros': len(self._registros),
+            'guardados_bd': sum(1 for r in self._registros if r.get('guardado_bd')),
+            'total_debe': sum(r.get('total_debe', 0) for r in self._registros),
+            'total_haber': sum(r.get('total_haber', 0) for r in self._registros),
+            'empresas_unicas': len(set(r.get('empresa', '') for r in self._registros)),
+            'periodos_unicos': len(set(r.get('periodo', '') for r in self._registros))
+        }
+
+    @property
+    def registros(self):
+        return self._registros.copy()
+
+
+# =============================================================================
+# CLASE: GestorEstadisticas (Informes y estadísticas)
+# =============================================================================
+class GestorEstadisticas:
+    """Genera informes y estadísticas de procesamiento"""
+
+    def __init__(self):
+        self.logger = Logger()
+        self.historico = HistoricoAsientos()
+        self.config = Configuracion()
+
+    def generar_resumen_periodo(self, periodo=None):
+        """Genera resumen de un período específico o del mes actual"""
+        if not periodo:
+            periodo = datetime.now().strftime("%B %Y").capitalize()
+
+        filtros = {'periodo': periodo}
+        registros = self.historico.buscar(filtros)
+
+        return {
+            'periodo': periodo,
+            'total_asientos': len(registros),
+            'guardados_bd': sum(1 for r in registros if r.get('guardado_bd')),
+            'pendientes': sum(1 for r in registros if not r.get('guardado_bd')),
+            'total_debe': sum(r.get('total_debe', 0) for r in registros),
+            'total_haber': sum(r.get('total_haber', 0) for r in registros),
+            'empresas': list(set(r.get('empresa', '') for r in registros if r.get('empresa'))),
+            'cuadrados': sum(1 for r in registros if r.get('cuadrado')),
+            'descuadrados': sum(1 for r in registros if not r.get('cuadrado'))
+        }
+
+    def generar_resumen_empresa(self, cif=None, nombre=None):
+        """Genera resumen por empresa"""
+        filtros = {}
+        if cif:
+            filtros['cif'] = cif
+        if nombre:
+            filtros['empresa'] = nombre
+
+        registros = self.historico.buscar(filtros)
+
+        return {
+            'empresa': nombre or cif,
+            'total_asientos': len(registros),
+            'guardados_bd': sum(1 for r in registros if r.get('guardado_bd')),
+            'total_debe': sum(r.get('total_debe', 0) for r in registros),
+            'total_haber': sum(r.get('total_haber', 0) for r in registros),
+            'periodos': list(set(r.get('periodo', '') for r in registros if r.get('periodo'))),
+            'primer_asiento': min((r.get('fecha_asiento', '') for r in registros), default=''),
+            'ultimo_asiento': max((r.get('fecha_asiento', '') for r in registros), default='')
+        }
+
+    def generar_dashboard(self):
+        """Genera datos para el dashboard principal"""
+        stats = self.historico.get_estadisticas()
+        log_stats = {
+            'total_logs': len(self.logger.registros),
+            'errores': self.logger.errores
+        }
+
+        # Últimos 7 días
+        hace_7_dias = (datetime.now() - __import__('datetime').timedelta(days=7)).strftime("%Y-%m-%d")
+        registros_recientes = self.historico.buscar({'fecha_desde': hace_7_dias})
+
+        # Por mes (últimos 6 meses)
+        meses = {}
+        for r in self.historico.registros:
+            fecha = r.get('fecha_asiento', '')[:7]  # YYYY-MM
+            if fecha:
+                meses[fecha] = meses.get(fecha, 0) + 1
+
+        return {
+            'total_asientos': stats['total_registros'],
+            'guardados_bd': stats['guardados_bd'],
+            'total_debe': stats['total_debe'],
+            'total_haber': stats['total_haber'],
+            'empresas_unicas': stats['empresas_unicas'],
+            'asientos_7_dias': len(registros_recientes),
+            'logs_totales': log_stats['total_logs'],
+            'errores_totales': log_stats['errores'],
+            'por_mes': dict(sorted(meses.items())[-6:])  # Últimos 6 meses
+        }
+
+    def exportar_informe_excel(self, ruta, filtros=None):
+        """Exporta informe a Excel"""
+        try:
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill, Alignment
+        except ImportError:
+            import subprocess
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'openpyxl', '-q'])
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill, Alignment
+
+        registros = self.historico.buscar(filtros)
+        stats = self.generar_dashboard()
+
+        wb = openpyxl.Workbook()
+
+        # === Hoja 1: Resumen ===
+        ws = wb.active
+        ws.title = "Resumen"
+
+        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        header_font = Font(color="FFFFFF", bold=True)
+
+        ws['A1'] = "INFORME DE ASIENTOS CONTABLES"
+        ws['A1'].font = Font(size=16, bold=True)
+        ws['A2'] = f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+
+        ws['A4'] = "Total asientos:"
+        ws['B4'] = stats['total_asientos']
+        ws['A5'] = "Guardados en BD:"
+        ws['B5'] = stats['guardados_bd']
+        ws['A6'] = "Total Debe:"
+        ws['B6'] = stats['total_debe']
+        ws['A7'] = "Total Haber:"
+        ws['B7'] = stats['total_haber']
+        ws['A8'] = "Empresas únicas:"
+        ws['B8'] = stats['empresas_unicas']
+
+        # === Hoja 2: Detalle ===
+        ws2 = wb.create_sheet("Detalle")
+        headers = ['Fecha', 'Nº Asiento', 'Empresa', 'CIF', 'Período', 'Debe', 'Haber', 'Guardado']
+
+        for col, header in enumerate(headers, 1):
+            cell = ws2.cell(row=1, column=col, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+
+        for row, r in enumerate(registros, 2):
+            ws2.cell(row=row, column=1, value=r.get('fecha_asiento', ''))
+            ws2.cell(row=row, column=2, value=r.get('numero_asiento', ''))
+            ws2.cell(row=row, column=3, value=r.get('empresa', ''))
+            ws2.cell(row=row, column=4, value=r.get('cif', ''))
+            ws2.cell(row=row, column=5, value=r.get('periodo', ''))
+            ws2.cell(row=row, column=6, value=r.get('total_debe', 0))
+            ws2.cell(row=row, column=7, value=r.get('total_haber', 0))
+            ws2.cell(row=row, column=8, value='Sí' if r.get('guardado_bd') else 'No')
+
+        wb.save(ruta)
+        self.logger.info(f"Informe exportado a: {ruta}")
+        return True
+
+    def exportar_informe_csv(self, ruta, filtros=None):
+        """Exporta informe a CSV"""
+        registros = self.historico.buscar(filtros)
+
+        with open(ruta, 'w', encoding='utf-8-sig') as f:
+            f.write("Fecha;Nº Asiento;Empresa;CIF;Período;Debe;Haber;Guardado\n")
+
+            for r in registros:
+                f.write(f"{r.get('fecha_asiento', '')};")
+                f.write(f"{r.get('numero_asiento', '')};")
+                f.write(f"{r.get('empresa', '')};")
+                f.write(f"{r.get('cif', '')};")
+                f.write(f"{r.get('periodo', '')};")
+                f.write(f"{r.get('total_debe', 0)};")
+                f.write(f"{r.get('total_haber', 0)};")
+                f.write(f"{'Sí' if r.get('guardado_bd') else 'No'}\n")
+
+        self.logger.info(f"Informe CSV exportado a: {ruta}")
+        return True
 
 
 # =============================================================================
@@ -2900,9 +3382,12 @@ class AplicacionFase3:
         self.label_errores.pack(side='left', padx=(0, 10))
 
         ttk.Button(frame_log, text="📋 Ver Log", command=self._abrir_log).pack(side='left', padx=(0, 5))
-        ttk.Button(frame_log, text="📦 Proceso Masivo", command=self._abrir_proceso_masivo).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_log, text="📦 Masivo", command=self._abrir_proceso_masivo).pack(side='left', padx=(0, 5))
         ttk.Button(frame_log, text="✔️ Validar", command=self._validar_documento).pack(side='left', padx=(0, 5))
-        ttk.Button(frame_log, text="📝 Generar Asiento", command=self._generar_asiento).pack(side='left')
+        ttk.Button(frame_log, text="📝 Asiento", command=self._generar_asiento).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_log, text="📊 Dashboard", command=self._abrir_dashboard).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_log, text="📚 Histórico", command=self._abrir_historico).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_log, text="⚙️ Config", command=self._abrir_configuracion).pack(side='left')
 
         # === FRAME PRINCIPAL ===
         main = ttk.Frame(self.root, padding=10)
@@ -3079,6 +3564,18 @@ class AplicacionFase3:
     def _abrir_proceso_masivo(self):
         """Abre la ventana de proceso masivo"""
         VentanaProcesoMasivo(self.root, self.db, self.gestor_plantillas)
+
+    def _abrir_dashboard(self):
+        """Abre el dashboard de estadísticas"""
+        VentanaDashboard(self.root)
+
+    def _abrir_historico(self):
+        """Abre la ventana de histórico de asientos"""
+        VentanaHistorico(self.root)
+
+    def _abrir_configuracion(self):
+        """Abre la ventana de configuración"""
+        VentanaConfiguracion(self.root)
 
     def _validar_documento(self):
         """Valida el documento actual y muestra alertas"""
@@ -3559,6 +4056,544 @@ class AplicacionFase3:
 
 
 # =============================================================================
+# CLASE: VentanaConfiguracion (Configuración de la aplicación)
+# =============================================================================
+class VentanaConfiguracion(tk.Toplevel):
+    """Ventana para configurar la aplicación"""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Configuración")
+        self.geometry("700x550")
+        self.minsize(600, 450)
+
+        self.config = Configuracion()
+        self.logger = Logger()
+
+        self._crear_ui()
+        self._cargar_valores()
+
+    def _crear_ui(self):
+        # Notebook con pestañas
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill='both', expand=True, padx=10, pady=10)
+
+        # === Pestaña 1: Base de datos ===
+        tab_bd = ttk.Frame(notebook, padding=15)
+        notebook.add(tab_bd, text="Base de Datos")
+
+        ttk.Label(tab_bd, text="Servidor:", font=('Arial', 10)).grid(row=0, column=0, sticky='w', pady=5)
+        self.var_server = tk.StringVar()
+        ttk.Entry(tab_bd, textvariable=self.var_server, width=30).grid(row=0, column=1, pady=5, sticky='w')
+
+        ttk.Label(tab_bd, text="Usuario:").grid(row=1, column=0, sticky='w', pady=5)
+        self.var_user = tk.StringVar()
+        ttk.Entry(tab_bd, textvariable=self.var_user, width=30).grid(row=1, column=1, pady=5, sticky='w')
+
+        ttk.Label(tab_bd, text="Contraseña:").grid(row=2, column=0, sticky='w', pady=5)
+        self.var_password = tk.StringVar()
+        ttk.Entry(tab_bd, textvariable=self.var_password, width=30, show='*').grid(row=2, column=1, pady=5, sticky='w')
+
+        ttk.Label(tab_bd, text="BD Geyce:").grid(row=3, column=0, sticky='w', pady=5)
+        self.var_db_geyce = tk.StringVar()
+        ttk.Entry(tab_bd, textvariable=self.var_db_geyce, width=30).grid(row=3, column=1, pady=5, sticky='w')
+
+        ttk.Label(tab_bd, text="BD EASP:").grid(row=4, column=0, sticky='w', pady=5)
+        self.var_db_easp = tk.StringVar()
+        ttk.Entry(tab_bd, textvariable=self.var_db_easp, width=30).grid(row=4, column=1, pady=5, sticky='w')
+
+        ttk.Button(tab_bd, text="🔌 Probar conexión",
+                  command=self._probar_conexion).grid(row=5, column=1, pady=20, sticky='w')
+
+        # === Pestaña 2: Cuentas contables ===
+        tab_cuentas = ttk.Frame(notebook, padding=15)
+        notebook.add(tab_cuentas, text="Cuentas Contables")
+
+        cuentas_labels = [
+            ('Sueldos y salarios:', 'sueldos'),
+            ('Complementos:', 'complementos'),
+            ('SS Empresa:', 'ss_empresa'),
+            ('IRPF:', 'irpf'),
+            ('SS Trabajador:', 'ss_trabajador'),
+            ('Neto a pagar:', 'neto_pagar'),
+            ('Banco/Caja:', 'banco')
+        ]
+
+        self.vars_cuentas = {}
+        for i, (label, key) in enumerate(cuentas_labels):
+            ttk.Label(tab_cuentas, text=label).grid(row=i, column=0, sticky='w', pady=5)
+            var = tk.StringVar()
+            self.vars_cuentas[key] = var
+            ttk.Entry(tab_cuentas, textvariable=var, width=15).grid(row=i, column=1, pady=5, sticky='w')
+
+        # === Pestaña 3: Validaciones ===
+        tab_val = ttk.Frame(notebook, padding=15)
+        notebook.add(tab_val, text="Validaciones")
+
+        ttk.Label(tab_val, text="SMI Mensual (€):").grid(row=0, column=0, sticky='w', pady=5)
+        self.var_smi = tk.StringVar()
+        ttk.Entry(tab_val, textvariable=self.var_smi, width=15).grid(row=0, column=1, pady=5, sticky='w')
+
+        ttk.Label(tab_val, text="Tolerancia cuadre (€):").grid(row=1, column=0, sticky='w', pady=5)
+        self.var_tolerancia = tk.StringVar()
+        ttk.Entry(tab_val, textvariable=self.var_tolerancia, width=15).grid(row=1, column=1, pady=5, sticky='w')
+
+        ttk.Label(tab_val, text="Salario máximo (€):").grid(row=2, column=0, sticky='w', pady=5)
+        self.var_max_sal = tk.StringVar()
+        ttk.Entry(tab_val, textvariable=self.var_max_sal, width=15).grid(row=2, column=1, pady=5, sticky='w')
+
+        ttk.Label(tab_val, text="Salario mínimo (€):").grid(row=3, column=0, sticky='w', pady=5)
+        self.var_min_sal = tk.StringVar()
+        ttk.Entry(tab_val, textvariable=self.var_min_sal, width=15).grid(row=3, column=1, pady=5, sticky='w')
+
+        # === Pestaña 4: Interfaz ===
+        tab_ui = ttk.Frame(notebook, padding=15)
+        notebook.add(tab_ui, text="Interfaz")
+
+        self.var_maximizar = tk.BooleanVar()
+        ttk.Checkbutton(tab_ui, text="Maximizar ventana al inicio",
+                       variable=self.var_maximizar).pack(anchor='w', pady=5)
+
+        self.var_tooltips = tk.BooleanVar()
+        ttk.Checkbutton(tab_ui, text="Mostrar tooltips",
+                       variable=self.var_tooltips).pack(anchor='w', pady=5)
+
+        self.var_autovalidar = tk.BooleanVar()
+        ttk.Checkbutton(tab_ui, text="Validar automáticamente al cargar PDF",
+                       variable=self.var_autovalidar).pack(anchor='w', pady=5)
+
+        ttk.Label(tab_ui, text="Idioma OCR:").pack(anchor='w', pady=(20, 5))
+        self.var_idioma_ocr = tk.StringVar()
+        idiomas = ttk.Combobox(tab_ui, textvariable=self.var_idioma_ocr,
+                               values=['spa', 'eng', 'fra', 'deu', 'ita', 'por'], width=10)
+        idiomas.pack(anchor='w')
+
+        # === Botones ===
+        frame_btns = ttk.Frame(self)
+        frame_btns.pack(fill='x', padx=10, pady=10)
+
+        ttk.Button(frame_btns, text="💾 Guardar",
+                  command=self._guardar).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_btns, text="🔄 Restaurar defaults",
+                  command=self._restaurar_defaults).pack(side='left')
+        ttk.Button(frame_btns, text="Cerrar",
+                  command=self.destroy).pack(side='right')
+
+    def _cargar_valores(self):
+        """Carga valores actuales de configuración"""
+        # BD
+        db = self.config.get('base_datos')
+        self.var_server.set(db.get('server', ''))
+        self.var_user.set(db.get('user', ''))
+        self.var_password.set(db.get('password', ''))
+        self.var_db_geyce.set(db.get('database_geyce', ''))
+        self.var_db_easp.set(db.get('database_easp', ''))
+
+        # Cuentas
+        for key, var in self.vars_cuentas.items():
+            var.set(self.config.get_cuenta(key))
+
+        # Validaciones
+        val = self.config.get('validaciones')
+        self.var_smi.set(str(val.get('smi_mensual', 1134)))
+        self.var_tolerancia.set(str(val.get('tolerancia_cuadre', 0.01)))
+        self.var_max_sal.set(str(val.get('max_salario', 15000)))
+        self.var_min_sal.set(str(val.get('min_salario', 800)))
+
+        # Interfaz
+        ui = self.config.get('interfaz')
+        self.var_maximizar.set(ui.get('maximizar_inicio', True))
+        self.var_tooltips.set(ui.get('mostrar_tooltips', True))
+        self.var_autovalidar.set(ui.get('auto_validar', True))
+        self.var_idioma_ocr.set(ui.get('idioma_ocr', 'spa'))
+
+    def _guardar(self):
+        """Guarda la configuración"""
+        try:
+            # BD
+            self.config.set('base_datos', 'server', self.var_server.get())
+            self.config.set('base_datos', 'user', self.var_user.get())
+            self.config.set('base_datos', 'password', self.var_password.get())
+            self.config.set('base_datos', 'database_geyce', self.var_db_geyce.get())
+            self.config.set('base_datos', 'database_easp', self.var_db_easp.get())
+
+            # Cuentas
+            for key, var in self.vars_cuentas.items():
+                self.config.set_cuenta(key, var.get())
+
+            # Validaciones
+            self.config.set('validaciones', 'smi_mensual', float(self.var_smi.get()))
+            self.config.set('validaciones', 'tolerancia_cuadre', float(self.var_tolerancia.get()))
+            self.config.set('validaciones', 'max_salario', float(self.var_max_sal.get()))
+            self.config.set('validaciones', 'min_salario', float(self.var_min_sal.get()))
+
+            # Interfaz
+            self.config.set('interfaz', 'maximizar_inicio', self.var_maximizar.get())
+            self.config.set('interfaz', 'mostrar_tooltips', self.var_tooltips.get())
+            self.config.set('interfaz', 'auto_validar', self.var_autovalidar.get())
+            self.config.set('interfaz', 'idioma_ocr', self.var_idioma_ocr.get())
+
+            messagebox.showinfo("Éxito", "Configuración guardada correctamente")
+            self.logger.info("Configuración guardada")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Error guardando configuración: {e}")
+
+    def _restaurar_defaults(self):
+        """Restaura valores por defecto"""
+        if messagebox.askyesno("Confirmar", "¿Restaurar toda la configuración a valores por defecto?"):
+            self.config.restaurar_defaults()
+            self._cargar_valores()
+            messagebox.showinfo("Info", "Configuración restaurada")
+
+    def _probar_conexion(self):
+        """Prueba la conexión a la base de datos"""
+        # Guardar temporalmente para probar
+        self._guardar()
+        db = DatabaseManager()
+        ok, msg = db.test_conexion()
+
+        if ok:
+            messagebox.showinfo("Conexión exitosa", f"Conectado a:\n{msg}")
+        else:
+            messagebox.showerror("Error de conexión", f"No se pudo conectar:\n{msg}")
+
+
+# =============================================================================
+# CLASE: VentanaHistorico (Histórico de asientos)
+# =============================================================================
+class VentanaHistorico(tk.Toplevel):
+    """Ventana para consultar el histórico de asientos"""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Histórico de Asientos")
+        self.geometry("1000x600")
+        self.minsize(800, 500)
+
+        self.historico = HistoricoAsientos()
+        self.logger = Logger()
+
+        self._crear_ui()
+        self._cargar_datos()
+
+    def _crear_ui(self):
+        main = ttk.Frame(self, padding=10)
+        main.pack(fill='both', expand=True)
+
+        # === Filtros ===
+        frame_filtros = ttk.LabelFrame(main, text="Filtros", padding=10)
+        frame_filtros.pack(fill='x', pady=(0, 10))
+
+        f1 = ttk.Frame(frame_filtros)
+        f1.pack(fill='x')
+
+        ttk.Label(f1, text="Empresa:").pack(side='left')
+        self.var_filtro_empresa = tk.StringVar()
+        ttk.Entry(f1, textvariable=self.var_filtro_empresa, width=25).pack(side='left', padx=(5, 15))
+
+        ttk.Label(f1, text="CIF:").pack(side='left')
+        self.var_filtro_cif = tk.StringVar()
+        ttk.Entry(f1, textvariable=self.var_filtro_cif, width=15).pack(side='left', padx=(5, 15))
+
+        ttk.Label(f1, text="Período:").pack(side='left')
+        self.var_filtro_periodo = tk.StringVar()
+        ttk.Entry(f1, textvariable=self.var_filtro_periodo, width=15).pack(side='left', padx=(5, 15))
+
+        self.var_solo_guardados = tk.BooleanVar()
+        ttk.Checkbutton(f1, text="Solo guardados en BD",
+                       variable=self.var_solo_guardados).pack(side='left', padx=(15, 0))
+
+        ttk.Button(f1, text="🔍 Buscar", command=self._buscar).pack(side='right')
+
+        # === Tabla ===
+        frame_tabla = ttk.Frame(main)
+        frame_tabla.pack(fill='both', expand=True, pady=(0, 10))
+
+        columnas = ('fecha', 'asiento', 'empresa', 'cif', 'periodo', 'debe', 'haber', 'guardado')
+        self.tree = ttk.Treeview(frame_tabla, columns=columnas, show='headings', height=15)
+
+        self.tree.heading('fecha', text='Fecha')
+        self.tree.heading('asiento', text='Nº Asiento')
+        self.tree.heading('empresa', text='Empresa')
+        self.tree.heading('cif', text='CIF')
+        self.tree.heading('periodo', text='Período')
+        self.tree.heading('debe', text='Debe')
+        self.tree.heading('haber', text='Haber')
+        self.tree.heading('guardado', text='BD')
+
+        self.tree.column('fecha', width=90, anchor='center')
+        self.tree.column('asiento', width=80, anchor='center')
+        self.tree.column('empresa', width=200)
+        self.tree.column('cif', width=100, anchor='center')
+        self.tree.column('periodo', width=100, anchor='center')
+        self.tree.column('debe', width=100, anchor='e')
+        self.tree.column('haber', width=100, anchor='e')
+        self.tree.column('guardado', width=50, anchor='center')
+
+        scroll = ttk.Scrollbar(frame_tabla, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+
+        scroll.pack(side='right', fill='y')
+        self.tree.pack(fill='both', expand=True)
+
+        # === Resumen ===
+        frame_resumen = ttk.Frame(main)
+        frame_resumen.pack(fill='x', pady=(0, 10))
+
+        self.var_total = tk.StringVar(value="Total: 0 registros")
+        self.var_suma = tk.StringVar(value="Suma: 0,00 €")
+
+        ttk.Label(frame_resumen, textvariable=self.var_total,
+                 font=('Arial', 10, 'bold')).pack(side='left', padx=(0, 20))
+        ttk.Label(frame_resumen, textvariable=self.var_suma,
+                 font=('Arial', 10)).pack(side='left')
+
+        # === Botones ===
+        frame_btns = ttk.Frame(main)
+        frame_btns.pack(fill='x')
+
+        ttk.Button(frame_btns, text="📊 Exportar Excel",
+                  command=self._exportar_excel).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_btns, text="📄 Exportar CSV",
+                  command=self._exportar_csv).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_btns, text="🗑️ Eliminar seleccionado",
+                  command=self._eliminar).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_btns, text="🧹 Limpiar histórico",
+                  command=self._limpiar).pack(side='left')
+
+        ttk.Button(frame_btns, text="Cerrar", command=self.destroy).pack(side='right')
+
+    def _cargar_datos(self, registros=None):
+        """Carga datos en la tabla"""
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        if registros is None:
+            registros = self.historico.registros
+
+        total_debe = 0
+        total_haber = 0
+
+        for r in registros:
+            debe = r.get('total_debe', 0)
+            haber = r.get('total_haber', 0)
+            total_debe += debe
+            total_haber += haber
+
+            debe_str = f"{debe:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
+            haber_str = f"{haber:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
+
+            self.tree.insert('', 'end', iid=r.get('id'), values=(
+                r.get('fecha_asiento', '')[:10],
+                r.get('numero_asiento', ''),
+                r.get('empresa', '')[:30],
+                r.get('cif', ''),
+                r.get('periodo', ''),
+                debe_str,
+                haber_str,
+                '✅' if r.get('guardado_bd') else '❌'
+            ))
+
+        self.var_total.set(f"Total: {len(registros)} registros")
+        suma_str = f"{total_debe:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
+        self.var_suma.set(f"Suma Debe: {suma_str} €")
+
+    def _buscar(self):
+        """Aplica filtros y busca"""
+        filtros = {}
+
+        if self.var_filtro_empresa.get():
+            filtros['empresa'] = self.var_filtro_empresa.get()
+        if self.var_filtro_cif.get():
+            filtros['cif'] = self.var_filtro_cif.get()
+        if self.var_filtro_periodo.get():
+            filtros['periodo'] = self.var_filtro_periodo.get()
+        if self.var_solo_guardados.get():
+            filtros['guardado_bd'] = True
+
+        registros = self.historico.buscar(filtros)
+        self._cargar_datos(registros)
+
+    def _eliminar(self):
+        """Elimina el registro seleccionado"""
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Aviso", "Seleccione un registro para eliminar")
+            return
+
+        if messagebox.askyesno("Confirmar", "¿Eliminar el registro seleccionado?"):
+            self.historico.eliminar(sel[0])
+            self._cargar_datos()
+
+    def _limpiar(self):
+        """Limpia todo el histórico"""
+        if messagebox.askyesno("Confirmar", "¿Eliminar TODO el histórico? Esta acción no se puede deshacer."):
+            self.historico.limpiar()
+            self._cargar_datos()
+
+    def _exportar_excel(self):
+        """Exporta a Excel"""
+        ruta = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx")]
+        )
+        if ruta:
+            stats = GestorEstadisticas()
+            stats.exportar_informe_excel(ruta)
+            messagebox.showinfo("Éxito", f"Exportado a:\n{ruta}")
+
+    def _exportar_csv(self):
+        """Exporta a CSV"""
+        ruta = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")]
+        )
+        if ruta:
+            stats = GestorEstadisticas()
+            stats.exportar_informe_csv(ruta)
+            messagebox.showinfo("Éxito", f"Exportado a:\n{ruta}")
+
+
+# =============================================================================
+# CLASE: VentanaDashboard (Panel de estadísticas)
+# =============================================================================
+class VentanaDashboard(tk.Toplevel):
+    """Dashboard con estadísticas y métricas"""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Dashboard - Estadísticas")
+        self.geometry("800x550")
+        self.minsize(700, 450)
+
+        self.stats = GestorEstadisticas()
+        self.logger = Logger()
+
+        self._crear_ui()
+        self._actualizar_datos()
+
+    def _crear_ui(self):
+        main = ttk.Frame(self, padding=15)
+        main.pack(fill='both', expand=True)
+
+        # === Título ===
+        ttk.Label(main, text="📊 Dashboard de Procesamiento",
+                 font=('Arial', 16, 'bold')).pack(pady=(0, 20))
+
+        # === Métricas principales ===
+        frame_metricas = ttk.Frame(main)
+        frame_metricas.pack(fill='x', pady=(0, 20))
+
+        # Crear tarjetas de métricas
+        self.metricas = {}
+        metricas_config = [
+            ('total', '📄 Total Asientos', '#3498db'),
+            ('guardados', '💾 Guardados BD', '#27ae60'),
+            ('empresas', '🏢 Empresas', '#9b59b6'),
+            ('recientes', '📅 Últimos 7 días', '#e67e22')
+        ]
+
+        for i, (key, titulo, color) in enumerate(metricas_config):
+            frame = ttk.LabelFrame(frame_metricas, text=titulo, padding=15)
+            frame.grid(row=0, column=i, padx=10, sticky='nsew')
+            frame_metricas.columnconfigure(i, weight=1)
+
+            var = tk.StringVar(value="0")
+            self.metricas[key] = var
+            ttk.Label(frame, textvariable=var, font=('Arial', 24, 'bold')).pack()
+
+        # === Totales económicos ===
+        frame_totales = ttk.LabelFrame(main, text="Totales Económicos", padding=15)
+        frame_totales.pack(fill='x', pady=(0, 20))
+
+        self.var_total_debe = tk.StringVar(value="0,00 €")
+        self.var_total_haber = tk.StringVar(value="0,00 €")
+
+        f_tot = ttk.Frame(frame_totales)
+        f_tot.pack()
+
+        ttk.Label(f_tot, text="Total Debe:", font=('Arial', 12)).grid(row=0, column=0, padx=10)
+        ttk.Label(f_tot, textvariable=self.var_total_debe,
+                 font=('Arial', 14, 'bold'), foreground='#2980b9').grid(row=0, column=1, padx=10)
+
+        ttk.Label(f_tot, text="Total Haber:", font=('Arial', 12)).grid(row=0, column=2, padx=10)
+        ttk.Label(f_tot, textvariable=self.var_total_haber,
+                 font=('Arial', 14, 'bold'), foreground='#27ae60').grid(row=0, column=3, padx=10)
+
+        # === Actividad por mes ===
+        frame_meses = ttk.LabelFrame(main, text="Actividad por Mes (últimos 6)", padding=10)
+        frame_meses.pack(fill='both', expand=True, pady=(0, 15))
+
+        self.tree_meses = ttk.Treeview(frame_meses, columns=('mes', 'cantidad'), show='headings', height=6)
+        self.tree_meses.heading('mes', text='Mes')
+        self.tree_meses.heading('cantidad', text='Asientos')
+        self.tree_meses.column('mes', width=150, anchor='center')
+        self.tree_meses.column('cantidad', width=100, anchor='center')
+        self.tree_meses.pack(fill='both', expand=True)
+
+        # === Log info ===
+        frame_log = ttk.Frame(main)
+        frame_log.pack(fill='x', pady=(0, 10))
+
+        self.var_logs = tk.StringVar(value="Logs: 0")
+        self.var_errores = tk.StringVar(value="Errores: 0")
+
+        ttk.Label(frame_log, textvariable=self.var_logs).pack(side='left', padx=(0, 20))
+        ttk.Label(frame_log, textvariable=self.var_errores, foreground='red').pack(side='left')
+
+        # === Botones ===
+        frame_btns = ttk.Frame(main)
+        frame_btns.pack(fill='x')
+
+        ttk.Button(frame_btns, text="🔄 Actualizar",
+                  command=self._actualizar_datos).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_btns, text="📊 Exportar informe",
+                  command=self._exportar_informe).pack(side='left')
+        ttk.Button(frame_btns, text="Cerrar", command=self.destroy).pack(side='right')
+
+    def _actualizar_datos(self):
+        """Actualiza los datos del dashboard"""
+        data = self.stats.generar_dashboard()
+
+        # Métricas
+        self.metricas['total'].set(str(data.get('total_asientos', 0)))
+        self.metricas['guardados'].set(str(data.get('guardados_bd', 0)))
+        self.metricas['empresas'].set(str(data.get('empresas_unicas', 0)))
+        self.metricas['recientes'].set(str(data.get('asientos_7_dias', 0)))
+
+        # Totales
+        debe = data.get('total_debe', 0)
+        haber = data.get('total_haber', 0)
+        self.var_total_debe.set(f"{debe:,.2f} €".replace(',', 'X').replace('.', ',').replace('X', '.'))
+        self.var_total_haber.set(f"{haber:,.2f} €".replace(',', 'X').replace('.', ',').replace('X', '.'))
+
+        # Por mes
+        for item in self.tree_meses.get_children():
+            self.tree_meses.delete(item)
+
+        for mes, cantidad in data.get('por_mes', {}).items():
+            self.tree_meses.insert('', 'end', values=(mes, cantidad))
+
+        # Logs
+        self.var_logs.set(f"Logs: {data.get('logs_totales', 0)}")
+        self.var_errores.set(f"Errores: {data.get('errores_totales', 0)}")
+
+    def _exportar_informe(self):
+        """Exporta informe completo"""
+        ruta = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv")]
+        )
+        if ruta:
+            if ruta.endswith('.xlsx'):
+                self.stats.exportar_informe_excel(ruta)
+            else:
+                self.stats.exportar_informe_csv(ruta)
+            messagebox.showinfo("Éxito", f"Informe exportado:\n{ruta}")
+
+
+# =============================================================================
 # CLASE: VentanaAsiento (Previsualización y edición de asientos)
 # =============================================================================
 class VentanaAsiento(tk.Toplevel):
@@ -3890,6 +4925,11 @@ class VentanaAsiento(tk.Toplevel):
 
             if exito:
                 self.asiento.guardado = True
+
+                # Registrar en histórico
+                historico = HistoricoAsientos()
+                historico.registrar(self.asiento, guardado_bd=True)
+
                 messagebox.showinfo("Éxito", f"Asiento {self.asiento.numero_asiento} guardado correctamente")
                 self.logger.info(f"Asiento guardado: {self.asiento.numero_asiento}")
 
