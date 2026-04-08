@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-LECTOR DE NÓMINAS - FASE 4: Proceso Masivo de Documentos
-Versión: 4.0.0
+LECTOR DE NÓMINAS - FASE 5: Validaciones y Verificaciones
+Versión: 5.0.0
 Fecha: 2026-04-08
 Autor: Claude para Jurado Asesores Tributarios - 2026
 
@@ -36,16 +36,24 @@ FUNCIONALIDADES FASE 3.5:
 - Detección de estructura basada en coordenadas
 - Fallback a PyMuPDF si OpenDataLoader no disponible
 
-FUNCIONALIDADES FASE 4 (NUEVA):
+FUNCIONALIDADES FASE 4:
 - Proceso masivo de múltiples PDFs
 - Cola de procesamiento con progreso visual
 - Tabla de resultados con estado por documento
 - Exportación a Excel/CSV
 - Generación masiva de asientos contables
 - Resumen estadístico del proceso
+
+FUNCIONALIDADES FASE 5 (NUEVA):
+- Validación de CIF/NIF español con dígito de control
+- Verificación de cuadre contable (debe = haber)
+- Detección de documentos duplicados (hash + fingerprint)
+- Validación de rangos de importes (alertas por anomalías)
+- Panel de alertas y advertencias en tiempo real
+- Informe de validación exportable
 """
 
-VERSION = "4.0.0"
+VERSION = "5.0.0"
 VERSION_FECHA = "2026-04-08"
 
 import tkinter as tk
@@ -301,6 +309,515 @@ class VentanaLog(tk.Toplevel):
         if messagebox.askyesno("Confirmar", "¿Limpiar todos los registros del log?"):
             self.logger.limpiar()
             self._cargar_registros()
+
+
+# =============================================================================
+# CLASE: ValidadorCIF (Validación de CIF/NIF español)
+# =============================================================================
+class ValidadorCIF:
+    """
+    Validador de CIF/NIF/NIE español con verificación de dígito de control.
+
+    Formatos soportados:
+    - NIF: 8 dígitos + letra (12345678Z)
+    - CIF: letra + 7 dígitos + dígito/letra control (A12345678)
+    - NIE: X/Y/Z + 7 dígitos + letra (X1234567L)
+    """
+
+    # Letras de control para NIF
+    LETRAS_NIF = "TRWAGMYFPDXBNJZSQVHLCKE"
+
+    # Letras válidas para CIF
+    LETRAS_CIF = "ABCDEFGHJNPQRSUVW"
+
+    # Letras de control para CIF (posición par)
+    LETRAS_CONTROL_CIF = "JABCDEFGHI"
+
+    @classmethod
+    def validar(cls, identificador):
+        """
+        Valida un CIF/NIF/NIE español.
+
+        Returns: (es_valido, tipo, mensaje)
+        """
+        if not identificador:
+            return False, None, "Identificador vacío"
+
+        # Limpiar y normalizar
+        id_limpio = identificador.upper().replace(' ', '').replace('-', '').replace('.', '')
+
+        if len(id_limpio) < 8 or len(id_limpio) > 9:
+            return False, None, f"Longitud incorrecta: {len(id_limpio)}"
+
+        primer_char = id_limpio[0]
+
+        # Determinar tipo y validar
+        if primer_char.isdigit():
+            # NIF personal (8 dígitos + letra)
+            return cls._validar_nif(id_limpio)
+        elif primer_char in 'XYZ':
+            # NIE (extranjero)
+            return cls._validar_nie(id_limpio)
+        elif primer_char in cls.LETRAS_CIF:
+            # CIF (empresa)
+            return cls._validar_cif(id_limpio)
+        else:
+            return False, None, f"Primer carácter no válido: {primer_char}"
+
+    @classmethod
+    def _validar_nif(cls, nif):
+        """Valida NIF personal (8 dígitos + letra)"""
+        if len(nif) != 9:
+            return False, 'NIF', "NIF debe tener 9 caracteres"
+
+        try:
+            numero = int(nif[:8])
+            letra = nif[8]
+            letra_correcta = cls.LETRAS_NIF[numero % 23]
+
+            if letra == letra_correcta:
+                return True, 'NIF', "NIF válido"
+            else:
+                return False, 'NIF', f"Letra incorrecta: esperada {letra_correcta}, recibida {letra}"
+        except ValueError:
+            return False, 'NIF', "Formato de NIF incorrecto"
+
+    @classmethod
+    def _validar_nie(cls, nie):
+        """Valida NIE (X/Y/Z + 7 dígitos + letra)"""
+        if len(nie) != 9:
+            return False, 'NIE', "NIE debe tener 9 caracteres"
+
+        # Reemplazar letra inicial por número equivalente
+        reemplazos = {'X': '0', 'Y': '1', 'Z': '2'}
+        nie_numerico = reemplazos.get(nie[0], nie[0]) + nie[1:]
+
+        return cls._validar_nif(nie_numerico)
+
+    @classmethod
+    def _validar_cif(cls, cif):
+        """Valida CIF de empresa"""
+        if len(cif) != 9:
+            return False, 'CIF', "CIF debe tener 9 caracteres"
+
+        letra_tipo = cif[0]
+        digitos = cif[1:8]
+        control = cif[8]
+
+        if not digitos.isdigit():
+            return False, 'CIF', "Dígitos centrales no válidos"
+
+        # Calcular dígito de control
+        suma = 0
+        for i, d in enumerate(digitos):
+            n = int(d)
+            if i % 2 == 0:  # Posiciones pares (0, 2, 4, 6)
+                n = n * 2
+                if n > 9:
+                    n = n - 9
+            suma += n
+
+        resto = suma % 10
+        digito_control = (10 - resto) % 10
+
+        # Algunos tipos de CIF usan letra de control, otros dígito
+        tipos_letra = 'KPQRSNW'
+
+        if letra_tipo in tipos_letra:
+            # Control es letra
+            letra_control = cls.LETRAS_CONTROL_CIF[digito_control]
+            if control == letra_control:
+                return True, 'CIF', f"CIF válido (tipo {letra_tipo})"
+            else:
+                return False, 'CIF', f"Control incorrecto: esperada {letra_control}"
+        else:
+            # Control puede ser letra o dígito
+            if control == str(digito_control) or control == cls.LETRAS_CONTROL_CIF[digito_control]:
+                return True, 'CIF', f"CIF válido (tipo {letra_tipo})"
+            else:
+                return False, 'CIF', f"Control incorrecto: esperado {digito_control} o {cls.LETRAS_CONTROL_CIF[digito_control]}"
+
+    @classmethod
+    def formatear(cls, identificador):
+        """Formatea un CIF/NIF de forma estándar"""
+        if not identificador:
+            return identificador
+        id_limpio = identificador.upper().replace(' ', '').replace('-', '').replace('.', '')
+        return id_limpio
+
+
+# =============================================================================
+# CLASE: ValidadorContable (Verificación de cuadre contable)
+# =============================================================================
+class ValidadorContable:
+    """Verifica el cuadre contable de asientos (debe = haber)"""
+
+    def __init__(self):
+        self.logger = Logger()
+        self.tolerancia = 0.01  # Tolerancia para diferencias por redondeo
+
+    def verificar_cuadre(self, conceptos):
+        """
+        Verifica que el asiento cuadre (suma debe = suma haber).
+
+        Args:
+            conceptos: Lista de {concepto, importe, tipo: 'debe'|'haber'}
+
+        Returns: (cuadra, suma_debe, suma_haber, diferencia, alertas)
+        """
+        suma_debe = 0.0
+        suma_haber = 0.0
+        alertas = []
+
+        for c in conceptos:
+            importe = c.get('importe') or 0
+            tipo = c.get('tipo', 'debe').lower()
+
+            if tipo == 'debe':
+                suma_debe += importe
+            elif tipo == 'haber':
+                suma_haber += importe
+            else:
+                alertas.append(f"Tipo desconocido '{tipo}' en concepto {c.get('concepto')}")
+
+        diferencia = abs(suma_debe - suma_haber)
+        cuadra = diferencia <= self.tolerancia
+
+        if not cuadra:
+            alertas.append(f"Descuadre de {diferencia:.2f} € (Debe: {suma_debe:.2f}, Haber: {suma_haber:.2f})")
+            self.logger.warning("Asiento descuadrado", f"Diferencia: {diferencia:.2f} €")
+
+        return cuadra, suma_debe, suma_haber, diferencia, alertas
+
+    def verificar_cuentas(self, conceptos, plan_cuentas=None):
+        """
+        Verifica que las cuentas asignadas existan en el plan de cuentas.
+
+        Returns: lista de alertas
+        """
+        alertas = []
+
+        if not plan_cuentas:
+            return alertas
+
+        cuentas_plan = {c['cuenta'] for c in plan_cuentas}
+
+        for c in conceptos:
+            cuenta = c.get('cuenta')
+            if cuenta and cuenta not in cuentas_plan:
+                alertas.append(f"Cuenta {cuenta} no existe en el plan de cuentas")
+
+        return alertas
+
+
+# =============================================================================
+# CLASE: DetectorDuplicados (Detección de documentos duplicados)
+# =============================================================================
+class DetectorDuplicados:
+    """Detecta documentos duplicados usando hash y fingerprints"""
+
+    def __init__(self):
+        self.logger = Logger()
+        self.documentos_procesados = {}  # {hash: info_documento}
+
+    def calcular_hash(self, texto):
+        """Calcula un hash del contenido del documento"""
+        texto_normalizado = ' '.join(texto.lower().split())
+        return hashlib.md5(texto_normalizado.encode()).hexdigest()
+
+    def calcular_fingerprint(self, texto, cif=None, periodo=None):
+        """
+        Calcula un fingerprint único basado en datos clave.
+        Útil para detectar el mismo documento con pequeñas variaciones.
+        """
+        partes = []
+
+        if cif:
+            partes.append(cif.upper())
+
+        if periodo:
+            partes.append(periodo.upper())
+
+        # Extraer importes principales (total devengado, neto)
+        patron_importe = r'(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})'
+        importes = re.findall(patron_importe, texto)
+        if importes:
+            # Usar los últimos 3 importes (suelen ser totales)
+            partes.extend(importes[-3:])
+
+        return '|'.join(partes)
+
+    def registrar_documento(self, texto, ruta, cif=None, periodo=None):
+        """
+        Registra un documento y detecta si es duplicado.
+
+        Returns: (es_duplicado, documento_original)
+        """
+        hash_doc = self.calcular_hash(texto)
+        fingerprint = self.calcular_fingerprint(texto, cif, periodo)
+
+        # Verificar hash exacto
+        if hash_doc in self.documentos_procesados:
+            original = self.documentos_procesados[hash_doc]
+            self.logger.warning(
+                f"Documento duplicado (hash exacto)",
+                f"Original: {original['ruta']}"
+            )
+            return True, original
+
+        # Verificar fingerprint (duplicado parcial)
+        for doc_hash, doc_info in self.documentos_procesados.items():
+            if doc_info.get('fingerprint') == fingerprint and fingerprint:
+                self.logger.warning(
+                    f"Posible documento duplicado (mismo CIF/período/importes)",
+                    f"Original: {doc_info['ruta']}"
+                )
+                return True, doc_info
+
+        # Registrar nuevo documento
+        self.documentos_procesados[hash_doc] = {
+            'ruta': ruta,
+            'hash': hash_doc,
+            'fingerprint': fingerprint,
+            'cif': cif,
+            'periodo': periodo
+        }
+
+        return False, None
+
+    def limpiar(self):
+        """Limpia el registro de documentos"""
+        self.documentos_procesados = {}
+
+
+# =============================================================================
+# CLASE: ValidadorImportes (Validación de rangos de importes)
+# =============================================================================
+class ValidadorImportes:
+    """Valida que los importes estén dentro de rangos razonables"""
+
+    # Rangos típicos para nóminas españolas (2024-2026)
+    RANGOS = {
+        'SALARIO BASE': (800, 15000),
+        'SALARIO': (800, 15000),
+        'PLUS': (0, 3000),
+        'COMPLEMENTO': (0, 5000),
+        'PRORRATA': (0, 3000),
+        'HORAS EXTRA': (0, 5000),
+        'ANTIGUEDAD': (0, 2000),
+        'IRPF': (0, 10000),
+        'SEGURIDAD SOCIAL': (0, 3000),
+        'CONTINGENCIAS': (0, 2000),
+        'DESEMPLEO': (0, 500),
+        'TOTAL DEVENGADO': (1000, 50000),
+        'TOTAL DEDUCCIONES': (100, 20000),
+        'NETO': (500, 40000),
+        'LIQUIDO': (500, 40000),
+    }
+
+    # SMI 2026 aproximado
+    SMI_MENSUAL = 1134.00
+
+    def __init__(self):
+        self.logger = Logger()
+
+    def validar(self, conceptos):
+        """
+        Valida los importes de los conceptos.
+
+        Returns: lista de alertas
+        """
+        alertas = []
+
+        for c in conceptos:
+            concepto = c.get('concepto', '').upper()
+            importe = c.get('importe')
+
+            if importe is None:
+                continue
+
+            # Importes negativos
+            if importe < 0:
+                alertas.append({
+                    'tipo': 'ERROR',
+                    'mensaje': f"Importe negativo en '{concepto}': {importe:.2f} €"
+                })
+                continue
+
+            # Verificar rango por tipo de concepto
+            for patron, (minimo, maximo) in self.RANGOS.items():
+                if patron in concepto:
+                    if importe < minimo:
+                        alertas.append({
+                            'tipo': 'WARNING',
+                            'mensaje': f"Importe muy bajo en '{concepto}': {importe:.2f} € (mín esperado: {minimo} €)"
+                        })
+                    elif importe > maximo:
+                        alertas.append({
+                            'tipo': 'WARNING',
+                            'mensaje': f"Importe muy alto en '{concepto}': {importe:.2f} € (máx esperado: {maximo} €)"
+                        })
+                    break
+
+        # Verificar neto vs SMI
+        neto = None
+        for c in conceptos:
+            if 'NETO' in c.get('concepto', '').upper() or 'LIQUIDO' in c.get('concepto', '').upper():
+                neto = c.get('importe')
+                break
+
+        if neto and neto < self.SMI_MENSUAL * 0.8:  # 80% del SMI
+            alertas.append({
+                'tipo': 'WARNING',
+                'mensaje': f"Neto ({neto:.2f} €) inferior al 80% del SMI ({self.SMI_MENSUAL:.2f} €)"
+            })
+
+        return alertas
+
+    def validar_coherencia(self, conceptos):
+        """
+        Valida la coherencia entre conceptos (ej: deducciones < devengos).
+
+        Returns: lista de alertas
+        """
+        alertas = []
+
+        total_devengado = None
+        total_deducciones = None
+        neto = None
+
+        for c in conceptos:
+            concepto = c.get('concepto', '').upper()
+            importe = c.get('importe')
+
+            if 'TOTAL' in concepto and 'DEVENG' in concepto:
+                total_devengado = importe
+            elif 'TOTAL' in concepto and 'DEDUCC' in concepto:
+                total_deducciones = importe
+            elif 'NETO' in concepto or 'LIQUIDO' in concepto:
+                neto = importe
+
+        # Verificar: devengado - deducciones = neto
+        if total_devengado and total_deducciones and neto:
+            esperado = total_devengado - total_deducciones
+            diferencia = abs(esperado - neto)
+            if diferencia > 0.10:  # Tolerancia de 10 céntimos
+                alertas.append({
+                    'tipo': 'ERROR',
+                    'mensaje': f"Incoherencia: Devengado ({total_devengado:.2f}) - Deducciones ({total_deducciones:.2f}) = {esperado:.2f}, pero Neto = {neto:.2f}"
+                })
+
+        # Verificar: deducciones < devengado
+        if total_devengado and total_deducciones:
+            if total_deducciones >= total_devengado:
+                alertas.append({
+                    'tipo': 'ERROR',
+                    'mensaje': f"Deducciones ({total_deducciones:.2f}) >= Devengado ({total_devengado:.2f})"
+                })
+
+        return alertas
+
+
+# =============================================================================
+# CLASE: GestorValidaciones (Orquestador de todas las validaciones)
+# =============================================================================
+class GestorValidaciones:
+    """Gestiona y ejecuta todas las validaciones de forma centralizada"""
+
+    def __init__(self):
+        self.logger = Logger()
+        self.validador_contable = ValidadorContable()
+        self.validador_importes = ValidadorImportes()
+        self.detector_duplicados = DetectorDuplicados()
+
+    def validar_documento(self, texto, ruta, cif=None, periodo=None, conceptos=None, plan_cuentas=None):
+        """
+        Ejecuta todas las validaciones sobre un documento.
+
+        Returns: {
+            'valido': bool,
+            'alertas': lista de alertas,
+            'errores': lista de errores,
+            'warnings': lista de advertencias,
+            'info': dict con información adicional
+        }
+        """
+        resultado = {
+            'valido': True,
+            'alertas': [],
+            'errores': [],
+            'warnings': [],
+            'info': {}
+        }
+
+        # 1. Validar CIF
+        if cif:
+            es_valido, tipo, mensaje = ValidadorCIF.validar(cif)
+            resultado['info']['cif_tipo'] = tipo
+            resultado['info']['cif_valido'] = es_valido
+
+            if not es_valido:
+                resultado['warnings'].append(f"CIF/NIF inválido: {mensaje}")
+
+        # 2. Detectar duplicados
+        es_duplicado, doc_original = self.detector_duplicados.registrar_documento(
+            texto, ruta, cif, periodo
+        )
+        resultado['info']['es_duplicado'] = es_duplicado
+
+        if es_duplicado:
+            resultado['warnings'].append(
+                f"Posible duplicado de: {doc_original['ruta']}"
+            )
+
+        # 3. Validar importes
+        if conceptos:
+            alertas_importes = self.validador_importes.validar(conceptos)
+            alertas_coherencia = self.validador_importes.validar_coherencia(conceptos)
+
+            for a in alertas_importes + alertas_coherencia:
+                if a['tipo'] == 'ERROR':
+                    resultado['errores'].append(a['mensaje'])
+                else:
+                    resultado['warnings'].append(a['mensaje'])
+
+        # 4. Validar cuadre contable
+        if conceptos:
+            cuadra, debe, haber, dif, alertas_cuadre = self.validador_contable.verificar_cuadre(conceptos)
+            resultado['info']['cuadre'] = {
+                'cuadra': cuadra,
+                'debe': debe,
+                'haber': haber,
+                'diferencia': dif
+            }
+
+            for a in alertas_cuadre:
+                resultado['warnings'].append(a)
+
+            # Validar cuentas contra plan
+            if plan_cuentas:
+                alertas_cuentas = self.validador_contable.verificar_cuentas(conceptos, plan_cuentas)
+                resultado['warnings'].extend(alertas_cuentas)
+
+        # Consolidar alertas
+        resultado['alertas'] = resultado['errores'] + resultado['warnings']
+        resultado['valido'] = len(resultado['errores']) == 0
+
+        # Log resumen
+        total_alertas = len(resultado['alertas'])
+        if total_alertas > 0:
+            self.logger.warning(
+                f"Validación completada con {total_alertas} alerta(s)",
+                f"Errores: {len(resultado['errores'])}, Warnings: {len(resultado['warnings'])}"
+            )
+        else:
+            self.logger.info("Validación completada sin alertas")
+
+        return resultado
+
+    def limpiar_duplicados(self):
+        """Limpia el registro de documentos duplicados"""
+        self.detector_duplicados.limpiar()
 
 
 # =============================================================================
@@ -1828,12 +2345,14 @@ class AplicacionFase3:
         self.gestor_plantillas = GestorPlantillas()
         self.detector = DetectorDocumento()
         self.extractor = ExtractorConceptos()
+        self.gestor_validaciones = GestorValidaciones()
 
         # Estado
         self.pdf = None
         self.empresa_actual = None
         self.plantilla_actual = None
         self.conceptos_extraidos = []
+        self.resultado_validacion = None
         self.imagen_tk = None
         self.queue = Queue()
 
@@ -1842,7 +2361,7 @@ class AplicacionFase3:
         self._procesar_cola()
         self._actualizar_contador_errores()
 
-        self.logger.info("Aplicación iniciada", f"Versión {VERSION} - Fase 3")
+        self.logger.info("Aplicación iniciada", f"Versión {VERSION} - Fase 5")
 
     def _procesar_cola(self):
         try:
@@ -1890,7 +2409,8 @@ class AplicacionFase3:
         self.label_errores.pack(side='left', padx=(0, 10))
 
         ttk.Button(frame_log, text="📋 Ver Log", command=self._abrir_log).pack(side='left', padx=(0, 5))
-        ttk.Button(frame_log, text="📦 Proceso Masivo", command=self._abrir_proceso_masivo).pack(side='left')
+        ttk.Button(frame_log, text="📦 Proceso Masivo", command=self._abrir_proceso_masivo).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_log, text="✔️ Validar", command=self._validar_documento).pack(side='left')
 
         # === FRAME PRINCIPAL ===
         main = ttk.Frame(self.root, padding=10)
@@ -2068,6 +2588,48 @@ class AplicacionFase3:
         """Abre la ventana de proceso masivo"""
         VentanaProcesoMasivo(self.root, self.db, self.gestor_plantillas)
 
+    def _validar_documento(self):
+        """Valida el documento actual y muestra alertas"""
+        if not self.pdf or not self.pdf.texto:
+            messagebox.showwarning("Aviso", "Primero debe cargar un PDF")
+            return
+
+        def validar():
+            # Obtener plan de cuentas si hay empresa
+            plan_cuentas = None
+            if self.empresa_actual:
+                plan_cuentas = self.db.obtener_plan_cuentas(self.empresa_actual['codigo'])
+
+            # Ejecutar validaciones
+            resultado = self.gestor_validaciones.validar_documento(
+                texto=self.pdf.texto,
+                ruta=self.pdf.ruta,
+                cif=self.pdf.cif,
+                periodo=self.pdf.periodo,
+                conceptos=self.conceptos_extraidos,
+                plan_cuentas=plan_cuentas
+            )
+
+            self.resultado_validacion = resultado
+
+            # Mostrar ventana de resultados
+            def mostrar():
+                VentanaAlertas(self.root, resultado, self.pdf.nombre)
+
+                # Actualizar indicador visual
+                if resultado['valido']:
+                    self.var_estado_carga.set(f"✅ {self.pdf.nombre} - Validación OK")
+                else:
+                    errores = len(resultado['errores'])
+                    warnings = len(resultado['warnings'])
+                    self.var_estado_carga.set(
+                        f"⚠️ {self.pdf.nombre} - {errores} errores, {warnings} avisos"
+                    )
+
+            self.queue.put(mostrar)
+
+        threading.Thread(target=validar, daemon=True).start()
+
     def _verificar_bd(self):
         """Verifica conexión a BD en segundo plano"""
         def verificar():
@@ -2106,12 +2668,28 @@ class AplicacionFase3:
                     self.progreso.pack_forget()
 
                     if ok:
-                        # Mostrar datos
+                        # Mostrar datos con validación de CIF
                         self.var_cif.set(self.pdf.cif or "(No detectado)")
-                        self.label_cif_status.configure(
-                            text="✅" if self.pdf.cif else "⚠️",
-                            foreground='green' if self.pdf.cif else 'orange'
-                        )
+
+                        # Validar CIF/NIF
+                        if self.pdf.cif:
+                            cif_valido, cif_tipo, cif_msg = ValidadorCIF.validar(self.pdf.cif)
+                            if cif_valido:
+                                self.label_cif_status.configure(
+                                    text=f"✅ {cif_tipo}",
+                                    foreground='green'
+                                )
+                            else:
+                                self.label_cif_status.configure(
+                                    text="⚠️ Inválido",
+                                    foreground='orange'
+                                )
+                                self.logger.warning(f"CIF/NIF inválido: {cif_msg}")
+                        else:
+                            self.label_cif_status.configure(
+                                text="⚠️",
+                                foreground='orange'
+                            )
                         self.var_periodo.set(self.pdf.periodo or "(No detectado)")
                         self.var_anno.set(str(self.pdf.anno))
                         self.var_mes.set(str(self.pdf.mes))
@@ -2425,6 +3003,173 @@ class AplicacionFase3:
         ttk.Button(frame_btns, text="✏️ Editar", command=editar).pack(side='left', padx=(0, 5))
         ttk.Button(frame_btns, text="🗑️ Eliminar", command=eliminar).pack(side='left')
         ttk.Button(frame_btns, text="Cerrar", command=ventana.destroy).pack(side='right')
+
+
+# =============================================================================
+# CLASE: VentanaAlertas (Panel de alertas y validaciones)
+# =============================================================================
+class VentanaAlertas(tk.Toplevel):
+    """Ventana para mostrar alertas y resultados de validación"""
+
+    def __init__(self, parent, resultado_validacion, nombre_documento=""):
+        super().__init__(parent)
+        self.title(f"Validación: {nombre_documento}" if nombre_documento else "Resultado de Validación")
+        self.geometry("700x500")
+
+        self.resultado = resultado_validacion
+        self._crear_ui()
+
+    def _crear_ui(self):
+        main = ttk.Frame(self, padding=10)
+        main.pack(fill='both', expand=True)
+
+        # === Resumen ===
+        frame_resumen = ttk.LabelFrame(main, text="Resumen", padding=10)
+        frame_resumen.pack(fill='x', pady=(0, 10))
+
+        # Estado general
+        if self.resultado['valido']:
+            estado = "✅ Documento válido"
+            color = 'green'
+        else:
+            estado = "❌ Documento con errores"
+            color = 'red'
+
+        ttk.Label(frame_resumen, text=estado, font=('Arial', 14, 'bold'),
+                 foreground=color).pack(anchor='w')
+
+        # Contadores
+        frame_contadores = ttk.Frame(frame_resumen)
+        frame_contadores.pack(fill='x', pady=(10, 0))
+
+        ttk.Label(frame_contadores,
+                 text=f"❌ Errores: {len(self.resultado['errores'])}",
+                 foreground='red').pack(side='left', padx=(0, 20))
+        ttk.Label(frame_contadores,
+                 text=f"⚠️ Advertencias: {len(self.resultado['warnings'])}",
+                 foreground='orange').pack(side='left')
+
+        # === Información adicional ===
+        info = self.resultado.get('info', {})
+
+        if info:
+            frame_info = ttk.LabelFrame(main, text="Información", padding=10)
+            frame_info.pack(fill='x', pady=(0, 10))
+
+            # CIF
+            if 'cif_valido' in info:
+                icono = "✅" if info['cif_valido'] else "❌"
+                tipo = info.get('cif_tipo', 'Desconocido')
+                ttk.Label(frame_info, text=f"{icono} CIF/NIF: {tipo}").pack(anchor='w')
+
+            # Duplicado
+            if info.get('es_duplicado'):
+                ttk.Label(frame_info, text="⚠️ Posible documento duplicado",
+                         foreground='orange').pack(anchor='w')
+
+            # Cuadre contable
+            cuadre = info.get('cuadre', {})
+            if cuadre:
+                icono = "✅" if cuadre.get('cuadra') else "❌"
+                ttk.Label(frame_info,
+                         text=f"{icono} Cuadre: Debe {cuadre.get('debe', 0):.2f} € | Haber {cuadre.get('haber', 0):.2f} €"
+                         ).pack(anchor='w')
+                if not cuadre.get('cuadra'):
+                    ttk.Label(frame_info,
+                             text=f"   Diferencia: {cuadre.get('diferencia', 0):.2f} €",
+                             foreground='red').pack(anchor='w')
+
+        # === Lista de alertas ===
+        frame_alertas = ttk.LabelFrame(main, text="Alertas detalladas", padding=5)
+        frame_alertas.pack(fill='both', expand=True, pady=(0, 10))
+
+        # Treeview
+        columnas = ('tipo', 'mensaje')
+        tree = ttk.Treeview(frame_alertas, columns=columnas, show='headings', height=10)
+        tree.heading('tipo', text='Tipo')
+        tree.heading('mensaje', text='Mensaje')
+        tree.column('tipo', width=80, anchor='center')
+        tree.column('mensaje', width=550)
+
+        scroll = ttk.Scrollbar(frame_alertas, orient='vertical', command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+
+        # Añadir errores
+        for err in self.resultado['errores']:
+            tree.insert('', 'end', values=('❌ Error', err))
+
+        # Añadir warnings
+        for warn in self.resultado['warnings']:
+            tree.insert('', 'end', values=('⚠️ Aviso', warn))
+
+        if not self.resultado['alertas']:
+            tree.insert('', 'end', values=('✅', 'Sin alertas - Todo correcto'))
+
+        scroll.pack(side='right', fill='y')
+        tree.pack(fill='both', expand=True)
+
+        # === Botones ===
+        frame_btns = ttk.Frame(main)
+        frame_btns.pack(fill='x')
+
+        ttk.Button(frame_btns, text="Exportar informe",
+                  command=self._exportar_informe).pack(side='left')
+        ttk.Button(frame_btns, text="Cerrar",
+                  command=self.destroy).pack(side='right')
+
+    def _exportar_informe(self):
+        """Exporta el informe de validación a un archivo de texto"""
+        ruta = filedialog.asksaveasfilename(
+            title="Guardar informe",
+            defaultextension=".txt",
+            filetypes=[("Texto", "*.txt"), ("Todos", "*.*")]
+        )
+        if not ruta:
+            return
+
+        try:
+            with open(ruta, 'w', encoding='utf-8') as f:
+                f.write("=" * 60 + "\n")
+                f.write("INFORME DE VALIDACIÓN\n")
+                f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("=" * 60 + "\n\n")
+
+                # Estado
+                f.write(f"Estado: {'VÁLIDO' if self.resultado['valido'] else 'CON ERRORES'}\n")
+                f.write(f"Errores: {len(self.resultado['errores'])}\n")
+                f.write(f"Advertencias: {len(self.resultado['warnings'])}\n\n")
+
+                # Info
+                info = self.resultado.get('info', {})
+                if info:
+                    f.write("-" * 40 + "\n")
+                    f.write("INFORMACIÓN ADICIONAL\n")
+                    f.write("-" * 40 + "\n")
+                    for k, v in info.items():
+                        f.write(f"  {k}: {v}\n")
+                    f.write("\n")
+
+                # Errores
+                if self.resultado['errores']:
+                    f.write("-" * 40 + "\n")
+                    f.write("ERRORES\n")
+                    f.write("-" * 40 + "\n")
+                    for i, err in enumerate(self.resultado['errores'], 1):
+                        f.write(f"  {i}. {err}\n")
+                    f.write("\n")
+
+                # Warnings
+                if self.resultado['warnings']:
+                    f.write("-" * 40 + "\n")
+                    f.write("ADVERTENCIAS\n")
+                    f.write("-" * 40 + "\n")
+                    for i, warn in enumerate(self.resultado['warnings'], 1):
+                        f.write(f"  {i}. {warn}\n")
+
+            messagebox.showinfo("Éxito", f"Informe guardado en:\n{ruta}")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Error guardando informe: {e}")
 
 
 # =============================================================================
