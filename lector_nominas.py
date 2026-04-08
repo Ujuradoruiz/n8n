@@ -44,20 +44,29 @@ FUNCIONALIDADES FASE 4:
 - Generación masiva de asientos contables
 - Resumen estadístico del proceso
 
-FUNCIONALIDADES FASE 5 (NUEVA):
+FUNCIONALIDADES FASE 5:
 - Validación de CIF/NIF español con dígito de control
 - Verificación de cuadre contable (debe = haber)
 - Detección de documentos duplicados (hash + fingerprint)
 - Validación de rangos de importes (alertas por anomalías)
 - Panel de alertas y advertencias en tiempo real
 - Informe de validación exportable
+
+FUNCIONALIDADES FASE 6 (NUEVA):
+- Generación automática de asientos contables
+- Estructura completa: cabecera + líneas de apunte
+- Ventana de previsualización y edición de asientos
+- Inserción directa en base de datos Geyce
+- Cuadre automático del asiento
+- Soporte para múltiples líneas por concepto
+- Exportación de asiento a formato texto
 """
 
-VERSION = "5.0.0"
+VERSION = "6.0.0"
 VERSION_FECHA = "2026-04-08"
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 import os
 import sys
 import re
@@ -818,6 +827,390 @@ class GestorValidaciones:
     def limpiar_duplicados(self):
         """Limpia el registro de documentos duplicados"""
         self.detector_duplicados.limpiar()
+
+
+# =============================================================================
+# CLASE: LineaApunte (Línea individual de un asiento contable)
+# =============================================================================
+class LineaApunte:
+    """Representa una línea de apunte dentro de un asiento contable"""
+
+    def __init__(self):
+        self.numero_linea = 0
+        self.cuenta = ""           # Código de cuenta (ej: 6400000)
+        self.descripcion = ""      # Descripción de la cuenta
+        self.concepto = ""         # Concepto del apunte
+        self.debe = 0.0
+        self.haber = 0.0
+        self.documento = ""        # Referencia documento
+        self.contrapartida = ""    # Cuenta contrapartida
+
+    def to_dict(self):
+        return {
+            'numero_linea': self.numero_linea,
+            'cuenta': self.cuenta,
+            'descripcion': self.descripcion,
+            'concepto': self.concepto,
+            'debe': self.debe,
+            'haber': self.haber,
+            'documento': self.documento,
+            'contrapartida': self.contrapartida
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        linea = cls()
+        linea.numero_linea = data.get('numero_linea', 0)
+        linea.cuenta = data.get('cuenta', '')
+        linea.descripcion = data.get('descripcion', '')
+        linea.concepto = data.get('concepto', '')
+        linea.debe = data.get('debe', 0.0)
+        linea.haber = data.get('haber', 0.0)
+        linea.documento = data.get('documento', '')
+        linea.contrapartida = data.get('contrapartida', '')
+        return linea
+
+
+# =============================================================================
+# CLASE: AsientoContable (Estructura completa de asiento)
+# =============================================================================
+class AsientoContable:
+    """
+    Representa un asiento contable completo con cabecera y líneas.
+
+    Estructura típica de asiento de nómina:
+    - DEBE: Sueldos y salarios (640), SS empresa (642)
+    - HABER: HP IRPF (4751), SS trabajador (476), Remuneraciones pendientes (465)
+    """
+
+    def __init__(self):
+        self.numero_asiento = 0
+        self.fecha = datetime.now()
+        self.periodo = ""           # Mes/Año de la nómina
+        self.concepto_general = ""  # Descripción general del asiento
+        self.documento = ""         # Referencia (ej: NOM-2026-03)
+        self.diario = "1"          # Código de diario (1 = General)
+
+        # Datos de la empresa
+        self.codigo_empresa = ""
+        self.nombre_empresa = ""
+        self.cif_empresa = ""
+        self.base_datos = ""
+
+        # Líneas del asiento
+        self.lineas = []  # Lista de LineaApunte
+
+        # Totales
+        self.total_debe = 0.0
+        self.total_haber = 0.0
+
+        # Estado
+        self.cuadrado = False
+        self.guardado = False
+
+    def agregar_linea(self, cuenta, concepto, debe=0.0, haber=0.0, descripcion=""):
+        """Añade una línea al asiento"""
+        linea = LineaApunte()
+        linea.numero_linea = len(self.lineas) + 1
+        linea.cuenta = cuenta
+        linea.concepto = concepto
+        linea.descripcion = descripcion
+        linea.debe = debe
+        linea.haber = haber
+        linea.documento = self.documento
+
+        self.lineas.append(linea)
+        self._recalcular_totales()
+        return linea
+
+    def eliminar_linea(self, numero_linea):
+        """Elimina una línea del asiento"""
+        self.lineas = [l for l in self.lineas if l.numero_linea != numero_linea]
+        # Renumerar
+        for i, linea in enumerate(self.lineas):
+            linea.numero_linea = i + 1
+        self._recalcular_totales()
+
+    def _recalcular_totales(self):
+        """Recalcula totales y verifica cuadre"""
+        self.total_debe = sum(l.debe for l in self.lineas)
+        self.total_haber = sum(l.haber for l in self.lineas)
+        self.cuadrado = abs(self.total_debe - self.total_haber) < 0.01
+
+    def get_diferencia(self):
+        """Devuelve la diferencia entre debe y haber"""
+        return self.total_debe - self.total_haber
+
+    def cuadrar_automatico(self, cuenta_ajuste="5720000"):
+        """
+        Cuadra el asiento automáticamente añadiendo una línea de ajuste.
+        Por defecto usa la cuenta de banco/caja.
+        """
+        diferencia = self.get_diferencia()
+
+        if abs(diferencia) < 0.01:
+            return True  # Ya cuadra
+
+        if diferencia > 0:
+            # Falta haber
+            self.agregar_linea(
+                cuenta=cuenta_ajuste,
+                concepto="Ajuste automático",
+                haber=diferencia,
+                descripcion="Banco c/c"
+            )
+        else:
+            # Falta debe
+            self.agregar_linea(
+                cuenta=cuenta_ajuste,
+                concepto="Ajuste automático",
+                debe=abs(diferencia),
+                descripcion="Banco c/c"
+            )
+
+        return self.cuadrado
+
+    def to_dict(self):
+        """Convierte el asiento a diccionario"""
+        return {
+            'numero_asiento': self.numero_asiento,
+            'fecha': self.fecha.strftime("%Y-%m-%d"),
+            'periodo': self.periodo,
+            'concepto_general': self.concepto_general,
+            'documento': self.documento,
+            'diario': self.diario,
+            'codigo_empresa': self.codigo_empresa,
+            'nombre_empresa': self.nombre_empresa,
+            'cif_empresa': self.cif_empresa,
+            'base_datos': self.base_datos,
+            'lineas': [l.to_dict() for l in self.lineas],
+            'total_debe': self.total_debe,
+            'total_haber': self.total_haber,
+            'cuadrado': self.cuadrado
+        }
+
+    def to_texto(self):
+        """Genera representación en texto del asiento"""
+        lineas = []
+        lineas.append("=" * 70)
+        lineas.append(f"ASIENTO Nº {self.numero_asiento}")
+        lineas.append(f"Fecha: {self.fecha.strftime('%d/%m/%Y')}    Período: {self.periodo}")
+        lineas.append(f"Empresa: {self.nombre_empresa} ({self.cif_empresa})")
+        lineas.append(f"Concepto: {self.concepto_general}")
+        lineas.append("=" * 70)
+        lineas.append(f"{'Cuenta':<10} {'Descripción':<25} {'Debe':>12} {'Haber':>12}")
+        lineas.append("-" * 70)
+
+        for l in self.lineas:
+            debe_str = f"{l.debe:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.') if l.debe else ""
+            haber_str = f"{l.haber:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.') if l.haber else ""
+            lineas.append(f"{l.cuenta:<10} {l.concepto[:25]:<25} {debe_str:>12} {haber_str:>12}")
+
+        lineas.append("-" * 70)
+        total_debe = f"{self.total_debe:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
+        total_haber = f"{self.total_haber:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
+        lineas.append(f"{'TOTALES':<10} {'':<25} {total_debe:>12} {total_haber:>12}")
+
+        estado = "✅ CUADRADO" if self.cuadrado else f"❌ DESCUADRE: {self.get_diferencia():.2f}"
+        lineas.append(f"\nEstado: {estado}")
+
+        return "\n".join(lineas)
+
+
+# =============================================================================
+# CLASE: GeneradorAsientos (Genera asientos desde conceptos extraídos)
+# =============================================================================
+class GeneradorAsientos:
+    """
+    Genera asientos contables a partir de conceptos extraídos de nóminas.
+
+    Mapeo típico de nóminas españolas:
+    - 640: Sueldos y salarios (DEBE)
+    - 642: Seguridad Social a cargo empresa (DEBE)
+    - 4751: HP Acreedora por retenciones IRPF (HABER)
+    - 476: Organismos SS acreedores (HABER)
+    - 465: Remuneraciones pendientes de pago (HABER)
+    - 572: Bancos (HABER - cuando se paga)
+    """
+
+    # Mapeo por defecto de conceptos a cuentas
+    MAPEO_CUENTAS = {
+        # Devengos (DEBE)
+        'SALARIO': {'cuenta': '6400000', 'tipo': 'debe', 'descripcion': 'Sueldos y salarios'},
+        'SUELDO': {'cuenta': '6400000', 'tipo': 'debe', 'descripcion': 'Sueldos y salarios'},
+        'BASE': {'cuenta': '6400000', 'tipo': 'debe', 'descripcion': 'Sueldos y salarios'},
+        'PLUS': {'cuenta': '6400001', 'tipo': 'debe', 'descripcion': 'Complementos salariales'},
+        'COMPLEMENTO': {'cuenta': '6400001', 'tipo': 'debe', 'descripcion': 'Complementos salariales'},
+        'PRORRATA': {'cuenta': '6400002', 'tipo': 'debe', 'descripcion': 'Prorrata pagas extras'},
+        'HORAS EXTRA': {'cuenta': '6400003', 'tipo': 'debe', 'descripcion': 'Horas extraordinarias'},
+        'ANTIGUEDAD': {'cuenta': '6400004', 'tipo': 'debe', 'descripcion': 'Antigüedad'},
+        'DIETA': {'cuenta': '6290000', 'tipo': 'debe', 'descripcion': 'Dietas'},
+        'SS EMPRESA': {'cuenta': '6420000', 'tipo': 'debe', 'descripcion': 'SS a cargo empresa'},
+        'CONTINGENCIAS COMUNES EMPRESA': {'cuenta': '6420000', 'tipo': 'debe', 'descripcion': 'SS a cargo empresa'},
+
+        # Deducciones (HABER)
+        'IRPF': {'cuenta': '4751000', 'tipo': 'haber', 'descripcion': 'HP Acreedora IRPF'},
+        'I.R.P.F': {'cuenta': '4751000', 'tipo': 'haber', 'descripcion': 'HP Acreedora IRPF'},
+        'RETENCION': {'cuenta': '4751000', 'tipo': 'haber', 'descripcion': 'HP Acreedora IRPF'},
+        'SS TRABAJADOR': {'cuenta': '4760000', 'tipo': 'haber', 'descripcion': 'SS a cargo trabajador'},
+        'CONTINGENCIAS COMUNES': {'cuenta': '4760000', 'tipo': 'haber', 'descripcion': 'SS a cargo trabajador'},
+        'DESEMPLEO': {'cuenta': '4760001', 'tipo': 'haber', 'descripcion': 'Desempleo trabajador'},
+        'FORMACION': {'cuenta': '4760002', 'tipo': 'haber', 'descripcion': 'Formación profesional'},
+
+        # Totales
+        'NETO': {'cuenta': '4650000', 'tipo': 'haber', 'descripcion': 'Remuneraciones pendientes'},
+        'LIQUIDO': {'cuenta': '4650000', 'tipo': 'haber', 'descripcion': 'Remuneraciones pendientes'},
+        'TOTAL DEVENGADO': {'cuenta': None, 'tipo': 'info', 'descripcion': 'Total devengos'},
+        'TOTAL DEDUCCIONES': {'cuenta': None, 'tipo': 'info', 'descripcion': 'Total deducciones'},
+    }
+
+    def __init__(self):
+        self.logger = Logger()
+
+    def generar_desde_conceptos(self, conceptos, empresa=None, periodo=None, numero_asiento=None):
+        """
+        Genera un asiento contable a partir de los conceptos extraídos.
+
+        Args:
+            conceptos: Lista de conceptos extraídos con importe y mapeo
+            empresa: Dict con datos de la empresa
+            periodo: String con el período (ej: "Marzo 2026")
+            numero_asiento: Número de asiento a asignar
+
+        Returns: AsientoContable
+        """
+        asiento = AsientoContable()
+
+        # Datos de cabecera
+        asiento.numero_asiento = numero_asiento or 0
+        asiento.periodo = periodo or ""
+        asiento.concepto_general = f"Nóminas {periodo}" if periodo else "Nóminas"
+        asiento.documento = f"NOM-{datetime.now().strftime('%Y-%m')}"
+
+        if empresa:
+            asiento.codigo_empresa = empresa.get('codigo', '')
+            asiento.nombre_empresa = empresa.get('nombre', '')
+            asiento.cif_empresa = empresa.get('cif', '')
+            asiento.base_datos = empresa.get('base_datos', '')
+
+        # Procesar conceptos
+        total_devengado = 0.0
+        total_deducciones = 0.0
+
+        for c in conceptos:
+            concepto_nombre = c.get('concepto', '').upper()
+            importe = c.get('importe')
+
+            if importe is None or importe == 0:
+                continue
+
+            # Saltar totales informativos
+            if 'TOTAL DEVENGADO' in concepto_nombre:
+                total_devengado = importe
+                continue
+            if 'TOTAL DEDUCCIONES' in concepto_nombre:
+                total_deducciones = importe
+                continue
+
+            # Buscar mapeo de cuenta
+            cuenta = c.get('cuenta')
+            tipo = c.get('tipo', 'debe')
+            descripcion = c.get('descripcion', '')
+
+            # Si no tiene cuenta asignada, buscar en mapeo por defecto
+            if not cuenta:
+                for patron, mapeo in self.MAPEO_CUENTAS.items():
+                    if patron in concepto_nombre:
+                        cuenta = mapeo['cuenta']
+                        tipo = mapeo['tipo']
+                        descripcion = mapeo['descripcion']
+                        break
+
+            # Saltar si no hay cuenta o es informativo
+            if not cuenta or tipo == 'info':
+                continue
+
+            # Crear línea de asiento
+            if tipo == 'debe':
+                asiento.agregar_linea(
+                    cuenta=cuenta,
+                    concepto=concepto_nombre[:50],
+                    debe=importe,
+                    descripcion=descripcion
+                )
+            else:
+                asiento.agregar_linea(
+                    cuenta=cuenta,
+                    concepto=concepto_nombre[:50],
+                    haber=importe,
+                    descripcion=descripcion
+                )
+
+        # Verificar si hay neto/líquido, si no, calcularlo
+        tiene_neto = any('NETO' in l.concepto or 'LIQUIDO' in l.concepto for l in asiento.lineas)
+
+        if not tiene_neto and total_devengado > 0 and total_deducciones > 0:
+            neto = total_devengado - total_deducciones
+            if neto > 0:
+                asiento.agregar_linea(
+                    cuenta='4650000',
+                    concepto='Neto a pagar (calculado)',
+                    haber=neto,
+                    descripcion='Remuneraciones pendientes'
+                )
+
+        self.logger.info(
+            f"Asiento generado: {len(asiento.lineas)} líneas",
+            f"Debe: {asiento.total_debe:.2f}, Haber: {asiento.total_haber:.2f}"
+        )
+
+        return asiento
+
+    def generar_asiento_simplificado(self, total_devengado, total_deducciones, neto,
+                                      empresa=None, periodo=None, numero_asiento=None):
+        """
+        Genera un asiento simplificado con las 3 líneas básicas:
+        - Sueldos y salarios (DEBE)
+        - HP IRPF + SS (HABER)
+        - Remuneraciones pendientes (HABER)
+        """
+        asiento = AsientoContable()
+
+        asiento.numero_asiento = numero_asiento or 0
+        asiento.periodo = periodo or ""
+        asiento.concepto_general = f"Nóminas {periodo}" if periodo else "Nóminas"
+        asiento.documento = f"NOM-{datetime.now().strftime('%Y-%m')}"
+
+        if empresa:
+            asiento.codigo_empresa = empresa.get('codigo', '')
+            asiento.nombre_empresa = empresa.get('nombre', '')
+            asiento.cif_empresa = empresa.get('cif', '')
+
+        # Línea 1: Sueldos (DEBE)
+        asiento.agregar_linea(
+            cuenta='6400000',
+            concepto='Sueldos y salarios',
+            debe=total_devengado,
+            descripcion='Sueldos y salarios'
+        )
+
+        # Línea 2: Deducciones (HABER) - simplificado en una cuenta
+        asiento.agregar_linea(
+            cuenta='4751000',
+            concepto='Retenciones y SS',
+            haber=total_deducciones,
+            descripcion='Retenciones IRPF y SS'
+        )
+
+        # Línea 3: Neto a pagar (HABER)
+        asiento.agregar_linea(
+            cuenta='4650000',
+            concepto='Neto a pagar',
+            haber=neto,
+            descripcion='Remuneraciones pendientes'
+        )
+
+        return asiento
 
 
 # =============================================================================
@@ -1962,6 +2355,102 @@ class DatabaseManager:
             self.logger.error(f"Error verificando cuenta {cuenta}", str(e))
             return False
 
+    def guardar_asiento(self, asiento):
+        """
+        Guarda un asiento contable en la base de datos.
+
+        Estructura típica de tabla ASIENTOS en Geyce:
+        - ASESSION: Número de asiento
+        - ANNO: Año del ejercicio
+        - DIARIO: Código de diario
+        - FECHA: Fecha del asiento
+        - CUENTA: Cuenta contable
+        - DEBE: Importe al debe
+        - HABER: Importe al haber
+        - CONCEPTO: Descripción
+        - DOCUMENTO: Referencia del documento
+
+        Args:
+            asiento: Objeto AsientoContable
+
+        Returns: True si se guardó correctamente
+        """
+        if not asiento.base_datos:
+            self.logger.error("No se especificó base de datos para el asiento")
+            return False
+
+        self.logger.info(
+            f"Guardando asiento {asiento.numero_asiento} en {asiento.base_datos}",
+            f"Líneas: {len(asiento.lineas)}"
+        )
+
+        try:
+            conn = self.conectar(asiento.base_datos)
+            cursor = conn.cursor()
+
+            # Obtener año del asiento
+            anno = asiento.fecha.year
+
+            # Insertar cada línea del asiento
+            for linea in asiento.lineas:
+                query = """
+                    INSERT INTO ASIENTOS
+                    (ASESSION, ANNO, DIARIO, FECHA, CUENTA, DEBE, HABER, CONCEPTO, DOCUMENTO)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """
+
+                params = (
+                    asiento.numero_asiento,
+                    anno,
+                    asiento.diario,
+                    asiento.fecha.strftime("%Y-%m-%d"),
+                    linea.cuenta,
+                    linea.debe if linea.debe else 0,
+                    linea.haber if linea.haber else 0,
+                    linea.concepto[:50] if linea.concepto else '',
+                    asiento.documento[:20] if asiento.documento else ''
+                )
+
+                cursor.execute(query, params)
+
+            # Confirmar transacción
+            conn.commit()
+
+            self.logger.info(f"Asiento {asiento.numero_asiento} guardado correctamente")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Error guardando asiento {asiento.numero_asiento}", str(e))
+            # Rollback en caso de error
+            try:
+                conn.rollback()
+            except:
+                pass
+            return False
+
+    def eliminar_asiento(self, codigo_empresa, numero_asiento, anno):
+        """Elimina un asiento existente"""
+        db_name = self.obtener_base_datos_contable(codigo_empresa)
+        if not db_name:
+            return False
+
+        try:
+            conn = self.conectar(db_name)
+            cursor = conn.cursor()
+
+            query = "DELETE FROM ASIENTOS WHERE ASESSION = ? AND ANNO = ?"
+            cursor.execute(query, (numero_asiento, anno))
+            conn.commit()
+
+            filas = cursor.rowcount
+            self.logger.info(f"Asiento {numero_asiento} eliminado ({filas} líneas)")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Error eliminando asiento {numero_asiento}", str(e))
+            return False
+
+
 # =============================================================================
 # CLASE: PDFProcessor
 # =============================================================================
@@ -2346,9 +2835,11 @@ class AplicacionFase3:
         self.detector = DetectorDocumento()
         self.extractor = ExtractorConceptos()
         self.gestor_validaciones = GestorValidaciones()
+        self.generador_asientos = GeneradorAsientos()
 
         # Estado
         self.pdf = None
+        self.asiento_actual = None
         self.empresa_actual = None
         self.plantilla_actual = None
         self.conceptos_extraidos = []
@@ -2410,7 +2901,8 @@ class AplicacionFase3:
 
         ttk.Button(frame_log, text="📋 Ver Log", command=self._abrir_log).pack(side='left', padx=(0, 5))
         ttk.Button(frame_log, text="📦 Proceso Masivo", command=self._abrir_proceso_masivo).pack(side='left', padx=(0, 5))
-        ttk.Button(frame_log, text="✔️ Validar", command=self._validar_documento).pack(side='left')
+        ttk.Button(frame_log, text="✔️ Validar", command=self._validar_documento).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_log, text="📝 Generar Asiento", command=self._generar_asiento).pack(side='left')
 
         # === FRAME PRINCIPAL ===
         main = ttk.Frame(self.root, padding=10)
@@ -2629,6 +3121,67 @@ class AplicacionFase3:
             self.queue.put(mostrar)
 
         threading.Thread(target=validar, daemon=True).start()
+
+    def _generar_asiento(self):
+        """Genera un asiento contable a partir de los conceptos extraídos"""
+        if not self.pdf or not self.pdf.texto:
+            messagebox.showwarning("Aviso", "Primero debe cargar un PDF")
+            return
+
+        if not self.conceptos_extraidos:
+            messagebox.showwarning("Aviso", "No hay conceptos extraídos. Cargue un PDF y espere a que se procese.")
+            return
+
+        def generar():
+            # Preparar datos de empresa
+            empresa_data = None
+            if self.empresa_actual:
+                empresa_data = {
+                    'codigo': self.empresa_actual.get('codigo'),
+                    'nombre': self.empresa_actual.get('nombre'),
+                    'cif': self.pdf.cif,
+                    'base_datos': self.db.obtener_base_datos_contable(self.empresa_actual.get('codigo'))
+                }
+
+            # Obtener número de asiento
+            numero_asiento = None
+            if self.empresa_actual and self.pdf.anno:
+                numero_asiento = self.db.obtener_siguiente_asiento(
+                    self.empresa_actual.get('codigo'),
+                    self.pdf.anno
+                )
+
+            # Generar asiento
+            asiento = self.generador_asientos.generar_desde_conceptos(
+                conceptos=self.conceptos_extraidos,
+                empresa=empresa_data,
+                periodo=self.pdf.periodo,
+                numero_asiento=numero_asiento
+            )
+
+            self.asiento_actual = asiento
+
+            # Mostrar ventana de asiento
+            def mostrar():
+                def callback_guardado(asiento_guardado):
+                    self.var_estado_carga.set(
+                        f"✅ Asiento {asiento_guardado.numero_asiento} guardado"
+                    )
+                    self.logger.info(
+                        f"Asiento guardado: {asiento_guardado.numero_asiento}",
+                        f"Empresa: {asiento_guardado.nombre_empresa}"
+                    )
+
+                VentanaAsiento(
+                    self.root,
+                    asiento,
+                    db_manager=self.db,
+                    callback_guardado=callback_guardado
+                )
+
+            self.queue.put(mostrar)
+
+        threading.Thread(target=generar, daemon=True).start()
 
     def _verificar_bd(self):
         """Verifica conexión a BD en segundo plano"""
@@ -3003,6 +3556,374 @@ class AplicacionFase3:
         ttk.Button(frame_btns, text="✏️ Editar", command=editar).pack(side='left', padx=(0, 5))
         ttk.Button(frame_btns, text="🗑️ Eliminar", command=eliminar).pack(side='left')
         ttk.Button(frame_btns, text="Cerrar", command=ventana.destroy).pack(side='right')
+
+
+# =============================================================================
+# CLASE: VentanaAsiento (Previsualización y edición de asientos)
+# =============================================================================
+class VentanaAsiento(tk.Toplevel):
+    """Ventana para previsualizar, editar y guardar asientos contables"""
+
+    def __init__(self, parent, asiento, db_manager=None, callback_guardado=None):
+        super().__init__(parent)
+        self.title(f"Asiento Contable - {asiento.concepto_general}")
+        self.geometry("900x650")
+        self.minsize(800, 500)
+
+        self.asiento = asiento
+        self.db = db_manager
+        self.callback_guardado = callback_guardado
+        self.logger = Logger()
+
+        self._crear_ui()
+        self._cargar_datos()
+
+    def _crear_ui(self):
+        main = ttk.Frame(self, padding=10)
+        main.pack(fill='both', expand=True)
+
+        # === Cabecera del asiento ===
+        frame_cab = ttk.LabelFrame(main, text="Datos del Asiento", padding=10)
+        frame_cab.pack(fill='x', pady=(0, 10))
+
+        # Fila 1
+        f1 = ttk.Frame(frame_cab)
+        f1.pack(fill='x', pady=(0, 5))
+
+        ttk.Label(f1, text="Nº Asiento:").pack(side='left')
+        self.var_numero = tk.StringVar()
+        ttk.Entry(f1, textvariable=self.var_numero, width=10).pack(side='left', padx=(5, 20))
+
+        ttk.Label(f1, text="Fecha:").pack(side='left')
+        self.var_fecha = tk.StringVar()
+        ttk.Entry(f1, textvariable=self.var_fecha, width=12).pack(side='left', padx=(5, 20))
+
+        ttk.Label(f1, text="Diario:").pack(side='left')
+        self.var_diario = tk.StringVar(value="1")
+        ttk.Entry(f1, textvariable=self.var_diario, width=5).pack(side='left', padx=(5, 20))
+
+        ttk.Label(f1, text="Documento:").pack(side='left')
+        self.var_documento = tk.StringVar()
+        ttk.Entry(f1, textvariable=self.var_documento, width=20).pack(side='left', padx=(5, 0))
+
+        # Fila 2
+        f2 = ttk.Frame(frame_cab)
+        f2.pack(fill='x', pady=(5, 0))
+
+        ttk.Label(f2, text="Empresa:").pack(side='left')
+        self.var_empresa = tk.StringVar()
+        ttk.Label(f2, textvariable=self.var_empresa, font=('Arial', 10, 'bold')).pack(side='left', padx=(5, 20))
+
+        ttk.Label(f2, text="Período:").pack(side='left')
+        self.var_periodo = tk.StringVar()
+        ttk.Entry(f2, textvariable=self.var_periodo, width=20).pack(side='left', padx=(5, 20))
+
+        ttk.Label(f2, text="Concepto:").pack(side='left')
+        self.var_concepto = tk.StringVar()
+        ttk.Entry(f2, textvariable=self.var_concepto, width=30).pack(side='left', padx=(5, 0))
+
+        # === Líneas del asiento ===
+        frame_lineas = ttk.LabelFrame(main, text="Líneas del Asiento", padding=5)
+        frame_lineas.pack(fill='both', expand=True, pady=(0, 10))
+
+        # Treeview
+        columnas = ('linea', 'cuenta', 'descripcion', 'concepto', 'debe', 'haber')
+        self.tree = ttk.Treeview(frame_lineas, columns=columnas, show='headings', height=12)
+
+        self.tree.heading('linea', text='#')
+        self.tree.heading('cuenta', text='Cuenta')
+        self.tree.heading('descripcion', text='Descripción')
+        self.tree.heading('concepto', text='Concepto')
+        self.tree.heading('debe', text='Debe')
+        self.tree.heading('haber', text='Haber')
+
+        self.tree.column('linea', width=40, anchor='center')
+        self.tree.column('cuenta', width=100, anchor='center')
+        self.tree.column('descripcion', width=180)
+        self.tree.column('concepto', width=200)
+        self.tree.column('debe', width=100, anchor='e')
+        self.tree.column('haber', width=100, anchor='e')
+
+        scroll = ttk.Scrollbar(frame_lineas, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+
+        scroll.pack(side='right', fill='y')
+        self.tree.pack(fill='both', expand=True)
+
+        # Botones de edición de líneas
+        frame_edit = ttk.Frame(frame_lineas)
+        frame_edit.pack(fill='x', pady=(5, 0))
+
+        ttk.Button(frame_edit, text="➕ Añadir línea",
+                  command=self._añadir_linea).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_edit, text="✏️ Editar línea",
+                  command=self._editar_linea).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_edit, text="🗑️ Eliminar línea",
+                  command=self._eliminar_linea).pack(side='left', padx=(0, 20))
+        ttk.Button(frame_edit, text="⚖️ Cuadrar automático",
+                  command=self._cuadrar_automatico).pack(side='left')
+
+        # === Totales ===
+        frame_totales = ttk.Frame(main)
+        frame_totales.pack(fill='x', pady=(0, 10))
+
+        # Totales
+        self.var_total_debe = tk.StringVar()
+        self.var_total_haber = tk.StringVar()
+        self.var_diferencia = tk.StringVar()
+
+        ttk.Label(frame_totales, text="Total Debe:", font=('Arial', 10, 'bold')).pack(side='left')
+        ttk.Label(frame_totales, textvariable=self.var_total_debe,
+                 font=('Arial', 10), foreground='blue').pack(side='left', padx=(5, 20))
+
+        ttk.Label(frame_totales, text="Total Haber:", font=('Arial', 10, 'bold')).pack(side='left')
+        ttk.Label(frame_totales, textvariable=self.var_total_haber,
+                 font=('Arial', 10), foreground='blue').pack(side='left', padx=(5, 20))
+
+        ttk.Label(frame_totales, text="Estado:").pack(side='left')
+        self.label_estado = ttk.Label(frame_totales, textvariable=self.var_diferencia,
+                                      font=('Arial', 10, 'bold'))
+        self.label_estado.pack(side='left', padx=(5, 0))
+
+        # === Botones de acción ===
+        frame_btns = ttk.Frame(main)
+        frame_btns.pack(fill='x')
+
+        ttk.Button(frame_btns, text="💾 Guardar en BD",
+                  command=self._guardar_bd).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_btns, text="📄 Exportar texto",
+                  command=self._exportar_texto).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_btns, text="📋 Copiar al portapapeles",
+                  command=self._copiar_portapapeles).pack(side='left')
+
+        ttk.Button(frame_btns, text="Cerrar",
+                  command=self.destroy).pack(side='right')
+
+    def _cargar_datos(self):
+        """Carga los datos del asiento en la UI"""
+        self.var_numero.set(str(self.asiento.numero_asiento))
+        self.var_fecha.set(self.asiento.fecha.strftime("%d/%m/%Y"))
+        self.var_diario.set(self.asiento.diario)
+        self.var_documento.set(self.asiento.documento)
+        self.var_empresa.set(f"{self.asiento.nombre_empresa} ({self.asiento.cif_empresa})")
+        self.var_periodo.set(self.asiento.periodo)
+        self.var_concepto.set(self.asiento.concepto_general)
+
+        self._actualizar_lineas()
+
+    def _actualizar_lineas(self):
+        """Actualiza la tabla de líneas"""
+        # Limpiar
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        # Añadir líneas
+        for linea in self.asiento.lineas:
+            debe_str = f"{linea.debe:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.') if linea.debe else ""
+            haber_str = f"{linea.haber:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.') if linea.haber else ""
+
+            self.tree.insert('', 'end', iid=str(linea.numero_linea), values=(
+                linea.numero_linea,
+                linea.cuenta,
+                linea.descripcion[:25],
+                linea.concepto[:30],
+                debe_str,
+                haber_str
+            ))
+
+        self._actualizar_totales()
+
+    def _actualizar_totales(self):
+        """Actualiza los totales del asiento"""
+        self.asiento._recalcular_totales()
+
+        total_debe = f"{self.asiento.total_debe:,.2f} €".replace(',', 'X').replace('.', ',').replace('X', '.')
+        total_haber = f"{self.asiento.total_haber:,.2f} €".replace(',', 'X').replace('.', ',').replace('X', '.')
+
+        self.var_total_debe.set(total_debe)
+        self.var_total_haber.set(total_haber)
+
+        if self.asiento.cuadrado:
+            self.var_diferencia.set("✅ CUADRADO")
+            self.label_estado.configure(foreground='green')
+        else:
+            dif = self.asiento.get_diferencia()
+            self.var_diferencia.set(f"❌ Diferencia: {dif:,.2f} €".replace(',', 'X').replace('.', ',').replace('X', '.'))
+            self.label_estado.configure(foreground='red')
+
+    def _añadir_linea(self):
+        """Abre diálogo para añadir nueva línea"""
+        self._dialogo_linea(None)
+
+    def _editar_linea(self):
+        """Edita la línea seleccionada"""
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Aviso", "Seleccione una línea para editar")
+            return
+
+        num_linea = int(sel[0])
+        linea = next((l for l in self.asiento.lineas if l.numero_linea == num_linea), None)
+        if linea:
+            self._dialogo_linea(linea)
+
+    def _dialogo_linea(self, linea_existente):
+        """Diálogo para añadir/editar línea"""
+        dialogo = tk.Toplevel(self)
+        dialogo.title("Editar línea" if linea_existente else "Nueva línea")
+        dialogo.geometry("400x300")
+        dialogo.transient(self)
+        dialogo.grab_set()
+
+        frame = ttk.Frame(dialogo, padding=15)
+        frame.pack(fill='both', expand=True)
+
+        # Campos
+        ttk.Label(frame, text="Cuenta:").grid(row=0, column=0, sticky='w', pady=5)
+        var_cuenta = tk.StringVar(value=linea_existente.cuenta if linea_existente else "")
+        ttk.Entry(frame, textvariable=var_cuenta, width=15).grid(row=0, column=1, sticky='w', pady=5)
+
+        ttk.Label(frame, text="Descripción:").grid(row=1, column=0, sticky='w', pady=5)
+        var_desc = tk.StringVar(value=linea_existente.descripcion if linea_existente else "")
+        ttk.Entry(frame, textvariable=var_desc, width=30).grid(row=1, column=1, sticky='w', pady=5)
+
+        ttk.Label(frame, text="Concepto:").grid(row=2, column=0, sticky='w', pady=5)
+        var_concepto = tk.StringVar(value=linea_existente.concepto if linea_existente else "")
+        ttk.Entry(frame, textvariable=var_concepto, width=30).grid(row=2, column=1, sticky='w', pady=5)
+
+        ttk.Label(frame, text="Debe:").grid(row=3, column=0, sticky='w', pady=5)
+        var_debe = tk.StringVar(value=str(linea_existente.debe) if linea_existente else "0")
+        ttk.Entry(frame, textvariable=var_debe, width=15).grid(row=3, column=1, sticky='w', pady=5)
+
+        ttk.Label(frame, text="Haber:").grid(row=4, column=0, sticky='w', pady=5)
+        var_haber = tk.StringVar(value=str(linea_existente.haber) if linea_existente else "0")
+        ttk.Entry(frame, textvariable=var_haber, width=15).grid(row=4, column=1, sticky='w', pady=5)
+
+        def guardar():
+            try:
+                debe = float(var_debe.get().replace(',', '.')) if var_debe.get() else 0
+                haber = float(var_haber.get().replace(',', '.')) if var_haber.get() else 0
+
+                if linea_existente:
+                    linea_existente.cuenta = var_cuenta.get()
+                    linea_existente.descripcion = var_desc.get()
+                    linea_existente.concepto = var_concepto.get()
+                    linea_existente.debe = debe
+                    linea_existente.haber = haber
+                else:
+                    self.asiento.agregar_linea(
+                        cuenta=var_cuenta.get(),
+                        concepto=var_concepto.get(),
+                        debe=debe,
+                        haber=haber,
+                        descripcion=var_desc.get()
+                    )
+
+                self._actualizar_lineas()
+                dialogo.destroy()
+
+            except ValueError:
+                messagebox.showerror("Error", "Importes no válidos")
+
+        ttk.Button(frame, text="Guardar", command=guardar).grid(row=5, column=0, pady=20)
+        ttk.Button(frame, text="Cancelar", command=dialogo.destroy).grid(row=5, column=1, pady=20)
+
+    def _eliminar_linea(self):
+        """Elimina la línea seleccionada"""
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Aviso", "Seleccione una línea para eliminar")
+            return
+
+        if messagebox.askyesno("Confirmar", "¿Eliminar la línea seleccionada?"):
+            num_linea = int(sel[0])
+            self.asiento.eliminar_linea(num_linea)
+            self._actualizar_lineas()
+
+    def _cuadrar_automatico(self):
+        """Cuadra el asiento automáticamente"""
+        if self.asiento.cuadrado:
+            messagebox.showinfo("Info", "El asiento ya está cuadrado")
+            return
+
+        # Pedir cuenta de ajuste
+        cuenta = tk.simpledialog.askstring(
+            "Cuenta de ajuste",
+            "Introduzca la cuenta para cuadrar el asiento:",
+            initialvalue="5720000",
+            parent=self
+        )
+
+        if cuenta:
+            self.asiento.cuadrar_automatico(cuenta)
+            self._actualizar_lineas()
+            if self.asiento.cuadrado:
+                messagebox.showinfo("Éxito", "Asiento cuadrado correctamente")
+
+    def _guardar_bd(self):
+        """Guarda el asiento en la base de datos"""
+        if not self.asiento.cuadrado:
+            if not messagebox.askyesno("Aviso", "El asiento no cuadra. ¿Desea guardarlo de todas formas?"):
+                return
+
+        if not self.db:
+            messagebox.showerror("Error", "No hay conexión a base de datos")
+            return
+
+        if not self.asiento.base_datos:
+            messagebox.showerror("Error", "No se ha especificado la base de datos de la empresa")
+            return
+
+        # Actualizar datos desde UI
+        try:
+            self.asiento.numero_asiento = int(self.var_numero.get())
+        except:
+            pass
+        self.asiento.documento = self.var_documento.get()
+        self.asiento.periodo = self.var_periodo.get()
+        self.asiento.concepto_general = self.var_concepto.get()
+        self.asiento.diario = self.var_diario.get()
+
+        # Intentar guardar
+        try:
+            exito = self.db.guardar_asiento(self.asiento)
+
+            if exito:
+                self.asiento.guardado = True
+                messagebox.showinfo("Éxito", f"Asiento {self.asiento.numero_asiento} guardado correctamente")
+                self.logger.info(f"Asiento guardado: {self.asiento.numero_asiento}")
+
+                if self.callback_guardado:
+                    self.callback_guardado(self.asiento)
+            else:
+                messagebox.showerror("Error", "No se pudo guardar el asiento")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Error guardando asiento: {e}")
+            self.logger.error("Error guardando asiento", str(e))
+
+    def _exportar_texto(self):
+        """Exporta el asiento a un archivo de texto"""
+        ruta = filedialog.asksaveasfilename(
+            title="Guardar asiento",
+            defaultextension=".txt",
+            filetypes=[("Texto", "*.txt")]
+        )
+        if not ruta:
+            return
+
+        try:
+            with open(ruta, 'w', encoding='utf-8') as f:
+                f.write(self.asiento.to_texto())
+            messagebox.showinfo("Éxito", f"Asiento exportado a:\n{ruta}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Error exportando: {e}")
+
+    def _copiar_portapapeles(self):
+        """Copia el asiento al portapapeles"""
+        self.clipboard_clear()
+        self.clipboard_append(self.asiento.to_texto())
+        messagebox.showinfo("Copiado", "Asiento copiado al portapapeles")
 
 
 # =============================================================================
