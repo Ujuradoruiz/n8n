@@ -61,7 +61,7 @@ FUNCIONALIDADES FASE 6:
 - Soporte para múltiples líneas por concepto
 - Exportación de asiento a formato texto
 
-FUNCIONALIDADES FASE 7 (NUEVA):
+FUNCIONALIDADES FASE 7:
 - Sistema de informes y estadísticas
 - Dashboard con métricas de procesamiento
 - Histórico de asientos generados con búsqueda
@@ -69,9 +69,17 @@ FUNCIONALIDADES FASE 7 (NUEVA):
 - Personalización de cuentas contables por defecto
 - Configuración de conexión a base de datos
 - Exportación de informes a PDF/Excel
+
+FUNCIONALIDADES FASE 7.5 (NUEVA):
+- Configuración de cuentas contables POR EMPRESA
+- Detección automática de empresa sin configurar
+- Ventana de configuración de subcuentas por empresa
+- Persistencia de configuración por CIF
+- Uso de cuentas específicas al generar asientos
+- Las cuentas globales son solo valores por defecto
 """
 
-VERSION = "7.0.0"
+VERSION = "7.5.0"
 VERSION_FECHA = "2026-04-08"
 
 import tkinter as tk
@@ -1075,10 +1083,64 @@ class GeneradorAsientos:
 
     def __init__(self):
         self.logger = Logger()
+        self.config_empresa = ConfiguracionEmpresa()
+
+    def _obtener_cuenta_empresa(self, cif, tipo_cuenta, cuenta_defecto):
+        """
+        Obtiene la cuenta específica de la empresa, o la cuenta por defecto.
+        """
+        if cif:
+            cuenta = self.config_empresa.obtener_cuenta(cif, tipo_cuenta)
+            if cuenta:
+                return cuenta
+        return cuenta_defecto
+
+    def _obtener_mapeo_para_empresa(self, cif):
+        """
+        Genera un mapeo de cuentas usando las cuentas específicas de la empresa.
+        """
+        # Obtener cuentas de la empresa o usar defaults
+        sueldos = self._obtener_cuenta_empresa(cif, 'sueldos', '6400000')
+        complementos = self._obtener_cuenta_empresa(cif, 'complementos', '6400001')
+        ss_empresa = self._obtener_cuenta_empresa(cif, 'ss_empresa', '6420000')
+        irpf = self._obtener_cuenta_empresa(cif, 'irpf', '4751000')
+        ss_trabajador = self._obtener_cuenta_empresa(cif, 'ss_trabajador', '4760000')
+        neto = self._obtener_cuenta_empresa(cif, 'neto_pagar', '4650000')
+
+        return {
+            # Devengos (DEBE)
+            'SALARIO': {'cuenta': sueldos, 'tipo': 'debe', 'descripcion': 'Sueldos y salarios'},
+            'SUELDO': {'cuenta': sueldos, 'tipo': 'debe', 'descripcion': 'Sueldos y salarios'},
+            'BASE': {'cuenta': sueldos, 'tipo': 'debe', 'descripcion': 'Sueldos y salarios'},
+            'PLUS': {'cuenta': complementos, 'tipo': 'debe', 'descripcion': 'Complementos salariales'},
+            'COMPLEMENTO': {'cuenta': complementos, 'tipo': 'debe', 'descripcion': 'Complementos salariales'},
+            'PRORRATA': {'cuenta': complementos, 'tipo': 'debe', 'descripcion': 'Prorrata pagas extras'},
+            'HORAS EXTRA': {'cuenta': complementos, 'tipo': 'debe', 'descripcion': 'Horas extraordinarias'},
+            'ANTIGUEDAD': {'cuenta': complementos, 'tipo': 'debe', 'descripcion': 'Antigüedad'},
+            'DIETA': {'cuenta': '6290000', 'tipo': 'debe', 'descripcion': 'Dietas'},
+            'SS EMPRESA': {'cuenta': ss_empresa, 'tipo': 'debe', 'descripcion': 'SS a cargo empresa'},
+            'CONTINGENCIAS COMUNES EMPRESA': {'cuenta': ss_empresa, 'tipo': 'debe', 'descripcion': 'SS a cargo empresa'},
+
+            # Deducciones (HABER)
+            'IRPF': {'cuenta': irpf, 'tipo': 'haber', 'descripcion': 'HP Acreedora IRPF'},
+            'I.R.P.F': {'cuenta': irpf, 'tipo': 'haber', 'descripcion': 'HP Acreedora IRPF'},
+            'RETENCION': {'cuenta': irpf, 'tipo': 'haber', 'descripcion': 'HP Acreedora IRPF'},
+            'SS TRABAJADOR': {'cuenta': ss_trabajador, 'tipo': 'haber', 'descripcion': 'SS a cargo trabajador'},
+            'CONTINGENCIAS COMUNES': {'cuenta': ss_trabajador, 'tipo': 'haber', 'descripcion': 'SS a cargo trabajador'},
+            'DESEMPLEO': {'cuenta': ss_trabajador, 'tipo': 'haber', 'descripcion': 'Desempleo trabajador'},
+            'FORMACION': {'cuenta': ss_trabajador, 'tipo': 'haber', 'descripcion': 'Formación profesional'},
+
+            # Totales
+            'NETO': {'cuenta': neto, 'tipo': 'haber', 'descripcion': 'Remuneraciones pendientes'},
+            'LIQUIDO': {'cuenta': neto, 'tipo': 'haber', 'descripcion': 'Remuneraciones pendientes'},
+            'TOTAL DEVENGADO': {'cuenta': None, 'tipo': 'info', 'descripcion': 'Total devengos'},
+            'TOTAL DEDUCCIONES': {'cuenta': None, 'tipo': 'info', 'descripcion': 'Total deducciones'},
+        }
 
     def generar_desde_conceptos(self, conceptos, empresa=None, periodo=None, numero_asiento=None):
         """
         Genera un asiento contable a partir de los conceptos extraídos.
+        Usa las cuentas específicas de la empresa si están configuradas.
 
         Args:
             conceptos: Lista de conceptos extraídos con importe y mapeo
@@ -1101,6 +1163,14 @@ class GeneradorAsientos:
             asiento.nombre_empresa = empresa.get('nombre', '')
             asiento.cif_empresa = empresa.get('cif', '')
             asiento.base_datos = empresa.get('base_datos', '')
+
+        # Obtener mapeo de cuentas específico para esta empresa
+        cif_empresa = empresa.get('cif') if empresa else None
+        mapeo_cuentas = self._obtener_mapeo_para_empresa(cif_empresa)
+
+        self.logger.debug(
+            f"Generando asiento con cuentas de empresa: {cif_empresa or 'defaults'}"
+        )
 
         # Procesar conceptos
         total_devengado = 0.0
@@ -1126,9 +1196,9 @@ class GeneradorAsientos:
             tipo = c.get('tipo', 'debe')
             descripcion = c.get('descripcion', '')
 
-            # Si no tiene cuenta asignada, buscar en mapeo por defecto
+            # Si no tiene cuenta asignada, buscar en mapeo de la empresa
             if not cuenta:
-                for patron, mapeo in self.MAPEO_CUENTAS.items():
+                for patron, mapeo in mapeo_cuentas.items():
                     if patron in concepto_nombre:
                         cuenta = mapeo['cuenta']
                         tipo = mapeo['tipo']
@@ -1161,8 +1231,10 @@ class GeneradorAsientos:
         if not tiene_neto and total_devengado > 0 and total_deducciones > 0:
             neto = total_devengado - total_deducciones
             if neto > 0:
+                # Usar cuenta de neto específica de la empresa
+                cuenta_neto = self._obtener_cuenta_empresa(cif_empresa, 'neto_pagar', '4650000')
                 asiento.agregar_linea(
-                    cuenta='4650000',
+                    cuenta=cuenta_neto,
                     concepto='Neto a pagar (calculado)',
                     haber=neto,
                     descripcion='Remuneraciones pendientes'
@@ -1366,6 +1438,204 @@ class Configuracion:
         self._config = self.DEFAULTS.copy()
         self._guardar()
         self.logger.info("Configuración restaurada a valores por defecto")
+
+
+# =============================================================================
+# CLASE: ConfiguracionEmpresa (Cuentas contables por empresa)
+# =============================================================================
+class ConfiguracionEmpresa:
+    """
+    Gestiona la configuración de cuentas contables específicas por empresa.
+    Cada empresa (identificada por CIF) tiene su propio mapeo de cuentas.
+    """
+    _instancia = None
+    EMPRESAS_DIR = Configuracion.CONFIG_DIR / 'empresas'
+
+    def __new__(cls):
+        if cls._instancia is None:
+            cls._instancia = super().__new__(cls)
+            cls._instancia._empresas = {}
+            cls._instancia.logger = Logger()
+            cls._instancia.config_global = Configuracion()
+            cls._instancia._cargar_todas()
+        return cls._instancia
+
+    def _cargar_todas(self):
+        """Carga todas las configuraciones de empresas"""
+        try:
+            self.EMPRESAS_DIR.mkdir(parents=True, exist_ok=True)
+
+            for archivo in self.EMPRESAS_DIR.glob("*.json"):
+                try:
+                    with open(archivo, 'r', encoding='utf-8') as f:
+                        datos = json.load(f)
+                        cif = datos.get('cif')
+                        if cif:
+                            self._empresas[cif] = datos
+                except Exception as e:
+                    self.logger.error(f"Error cargando config empresa {archivo}: {e}")
+
+            self.logger.debug(f"Configuraciones de empresa cargadas: {len(self._empresas)}")
+
+        except Exception as e:
+            self.logger.error(f"Error cargando configuraciones de empresas: {e}")
+
+    def _guardar_empresa(self, cif):
+        """Guarda la configuración de una empresa"""
+        if cif not in self._empresas:
+            return False
+
+        try:
+            self.EMPRESAS_DIR.mkdir(parents=True, exist_ok=True)
+            cif_clean = cif.replace(' ', '').replace('-', '').replace('.', '')
+            archivo = self.EMPRESAS_DIR / f"{cif_clean}.json"
+
+            with open(archivo, 'w', encoding='utf-8') as f:
+                json.dump(self._empresas[cif], f, indent=2, ensure_ascii=False)
+
+            self.logger.info(f"Configuración de empresa guardada: {cif}")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Error guardando config empresa {cif}: {e}")
+            return False
+
+    def existe_configuracion(self, cif):
+        """Verifica si existe configuración para una empresa"""
+        if not cif:
+            return False
+        cif_norm = cif.upper().replace(' ', '').replace('-', '').replace('.', '')
+        return cif_norm in self._empresas
+
+    def obtener_cuentas(self, cif):
+        """
+        Obtiene las cuentas contables de una empresa.
+        Si no existe configuración, devuelve None.
+        """
+        if not cif:
+            return None
+
+        cif_norm = cif.upper().replace(' ', '').replace('-', '').replace('.', '')
+
+        if cif_norm in self._empresas:
+            return self._empresas[cif_norm].get('cuentas', {})
+
+        return None
+
+    def obtener_cuenta(self, cif, tipo_cuenta):
+        """
+        Obtiene una cuenta específica de una empresa.
+        Si no existe, devuelve la cuenta por defecto global.
+        """
+        cuentas = self.obtener_cuentas(cif)
+
+        if cuentas and tipo_cuenta in cuentas:
+            return cuentas[tipo_cuenta]
+
+        # Fallback a configuración global
+        return self.config_global.get_cuenta(tipo_cuenta)
+
+    def crear_configuracion(self, cif, nombre_empresa, codigo_empresa=None):
+        """
+        Crea una nueva configuración de empresa con valores por defecto.
+        """
+        if not cif:
+            return False
+
+        cif_norm = cif.upper().replace(' ', '').replace('-', '').replace('.', '')
+
+        # Obtener cuentas por defecto de la configuración global
+        cuentas_defecto = self.config_global.get('cuentas_defecto', default={})
+
+        self._empresas[cif_norm] = {
+            'cif': cif_norm,
+            'nombre': nombre_empresa or '',
+            'codigo': codigo_empresa or '',
+            'fecha_creacion': datetime.now().isoformat(),
+            'fecha_modificacion': datetime.now().isoformat(),
+            'cuentas': cuentas_defecto.copy(),
+            'notas': ''
+        }
+
+        self._guardar_empresa(cif_norm)
+        self.logger.info(f"Configuración de empresa creada: {cif_norm} - {nombre_empresa}")
+        return True
+
+    def actualizar_cuentas(self, cif, cuentas):
+        """Actualiza las cuentas de una empresa"""
+        if not cif:
+            return False
+
+        cif_norm = cif.upper().replace(' ', '').replace('-', '').replace('.', '')
+
+        if cif_norm not in self._empresas:
+            return False
+
+        self._empresas[cif_norm]['cuentas'] = cuentas
+        self._empresas[cif_norm]['fecha_modificacion'] = datetime.now().isoformat()
+
+        return self._guardar_empresa(cif_norm)
+
+    def actualizar_cuenta(self, cif, tipo_cuenta, valor):
+        """Actualiza una cuenta específica de una empresa"""
+        if not cif:
+            return False
+
+        cif_norm = cif.upper().replace(' ', '').replace('-', '').replace('.', '')
+
+        if cif_norm not in self._empresas:
+            return False
+
+        if 'cuentas' not in self._empresas[cif_norm]:
+            self._empresas[cif_norm]['cuentas'] = {}
+
+        self._empresas[cif_norm]['cuentas'][tipo_cuenta] = valor
+        self._empresas[cif_norm]['fecha_modificacion'] = datetime.now().isoformat()
+
+        return self._guardar_empresa(cif_norm)
+
+    def obtener_info_empresa(self, cif):
+        """Obtiene toda la información de configuración de una empresa"""
+        if not cif:
+            return None
+
+        cif_norm = cif.upper().replace(' ', '').replace('-', '').replace('.', '')
+        return self._empresas.get(cif_norm)
+
+    def listar_empresas(self):
+        """Lista todas las empresas configuradas"""
+        return [
+            {
+                'cif': datos.get('cif'),
+                'nombre': datos.get('nombre'),
+                'codigo': datos.get('codigo'),
+                'fecha_modificacion': datos.get('fecha_modificacion')
+            }
+            for datos in self._empresas.values()
+        ]
+
+    def eliminar_configuracion(self, cif):
+        """Elimina la configuración de una empresa"""
+        if not cif:
+            return False
+
+        cif_norm = cif.upper().replace(' ', '').replace('-', '').replace('.', '')
+
+        if cif_norm not in self._empresas:
+            return False
+
+        del self._empresas[cif_norm]
+
+        # Eliminar archivo
+        try:
+            archivo = self.EMPRESAS_DIR / f"{cif_norm}.json"
+            if archivo.exists():
+                archivo.unlink()
+        except:
+            pass
+
+        self.logger.info(f"Configuración de empresa eliminada: {cif_norm}")
+        return True
 
 
 # =============================================================================
@@ -3629,6 +3899,41 @@ class AplicacionFase3:
             messagebox.showwarning("Aviso", "No hay conceptos extraídos. Cargue un PDF y espere a que se procese.")
             return
 
+        # Verificar si la empresa tiene configuración de cuentas
+        if self.pdf.cif:
+            config_emp = ConfiguracionEmpresa()
+            if not config_emp.existe_configuracion(self.pdf.cif):
+                # Mostrar diálogo para configurar cuentas
+                respuesta = messagebox.askyesno(
+                    "Configurar Empresa",
+                    f"La empresa con CIF {self.pdf.cif} no tiene cuentas contables configuradas.\n\n"
+                    "¿Desea configurar las subcuentas ahora?\n\n"
+                    "(Si elige 'No', se usarán las cuentas por defecto)"
+                )
+
+                if respuesta:
+                    nombre = self.empresa_actual.get('nombre', '') if self.empresa_actual else ''
+                    codigo = self.empresa_actual.get('codigo', '') if self.empresa_actual else ''
+
+                    def on_config_guardada(cuentas):
+                        # Después de configurar, generar el asiento
+                        self._generar_asiento_interno()
+
+                    VentanaCuentasEmpresa(
+                        self.root,
+                        cif=self.pdf.cif,
+                        nombre_empresa=nombre,
+                        codigo_empresa=codigo,
+                        es_nueva=True,
+                        callback_guardado=on_config_guardada
+                    )
+                    return
+
+        # Generar asiento directamente
+        self._generar_asiento_interno()
+
+    def _generar_asiento_interno(self):
+        """Genera el asiento contable (después de verificar configuración)"""
         def generar():
             # Preparar datos de empresa
             empresa_data = None
@@ -3648,7 +3953,7 @@ class AplicacionFase3:
                     self.pdf.anno
                 )
 
-            # Generar asiento
+            # Generar asiento (usará las cuentas de la empresa si están configuradas)
             asiento = self.generador_asientos.generar_desde_conceptos(
                 conceptos=self.conceptos_extraidos,
                 empresa=empresa_data,
@@ -4053,6 +4358,221 @@ class AplicacionFase3:
         ttk.Button(frame_btns, text="✏️ Editar", command=editar).pack(side='left', padx=(0, 5))
         ttk.Button(frame_btns, text="🗑️ Eliminar", command=eliminar).pack(side='left')
         ttk.Button(frame_btns, text="Cerrar", command=ventana.destroy).pack(side='right')
+
+
+# =============================================================================
+# CLASE: VentanaCuentasEmpresa (Configuración de cuentas por empresa)
+# =============================================================================
+class VentanaCuentasEmpresa(tk.Toplevel):
+    """Ventana para configurar las cuentas contables de una empresa específica"""
+
+    def __init__(self, parent, cif, nombre_empresa="", codigo_empresa="",
+                 es_nueva=False, callback_guardado=None):
+        super().__init__(parent)
+        self.title(f"Cuentas Contables - {nombre_empresa or cif}")
+        self.geometry("550x500")
+        self.minsize(450, 400)
+        self.transient(parent)
+        self.grab_set()
+
+        self.cif = cif
+        self.nombre_empresa = nombre_empresa
+        self.codigo_empresa = codigo_empresa
+        self.es_nueva = es_nueva
+        self.callback_guardado = callback_guardado
+
+        self.config_empresa = ConfiguracionEmpresa()
+        self.config_global = Configuracion()
+        self.logger = Logger()
+
+        # Si es nueva, crear configuración con defaults
+        if es_nueva and not self.config_empresa.existe_configuracion(cif):
+            self.config_empresa.crear_configuracion(cif, nombre_empresa, codigo_empresa)
+
+        self._crear_ui()
+        self._cargar_valores()
+
+    def _crear_ui(self):
+        main = ttk.Frame(self, padding=15)
+        main.pack(fill='both', expand=True)
+
+        # === Información de empresa ===
+        frame_info = ttk.LabelFrame(main, text="Información de Empresa", padding=10)
+        frame_info.pack(fill='x', pady=(0, 15))
+
+        ttk.Label(frame_info, text=f"CIF: {self.cif}", font=('Arial', 11, 'bold')).pack(anchor='w')
+        if self.nombre_empresa:
+            ttk.Label(frame_info, text=f"Nombre: {self.nombre_empresa}").pack(anchor='w')
+        if self.codigo_empresa:
+            ttk.Label(frame_info, text=f"Código: {self.codigo_empresa}").pack(anchor='w')
+
+        if self.es_nueva:
+            ttk.Label(frame_info, text="⚠️ Primera configuración - se usarán valores por defecto",
+                     foreground='orange').pack(anchor='w', pady=(5, 0))
+
+        # === Cuentas contables ===
+        frame_cuentas = ttk.LabelFrame(main, text="Cuentas Contables (Subcuentas)", padding=10)
+        frame_cuentas.pack(fill='both', expand=True, pady=(0, 15))
+
+        # Descripción
+        ttk.Label(frame_cuentas,
+                 text="Configure las subcuentas específicas para esta empresa:",
+                 foreground='gray').pack(anchor='w', pady=(0, 10))
+
+        # Grid de cuentas
+        frame_grid = ttk.Frame(frame_cuentas)
+        frame_grid.pack(fill='x')
+
+        cuentas_labels = [
+            ('Sueldos y salarios:', 'sueldos', '6400000'),
+            ('Complementos/Plus:', 'complementos', '6400001'),
+            ('SS a cargo empresa:', 'ss_empresa', '6420000'),
+            ('IRPF (retención):', 'irpf', '4751000'),
+            ('SS a cargo trabajador:', 'ss_trabajador', '4760000'),
+            ('Neto a pagar:', 'neto_pagar', '4650000'),
+            ('Banco/Caja:', 'banco', '5720000')
+        ]
+
+        self.vars_cuentas = {}
+        for i, (label, key, ejemplo) in enumerate(cuentas_labels):
+            ttk.Label(frame_grid, text=label).grid(row=i, column=0, sticky='w', pady=5, padx=(0, 10))
+            var = tk.StringVar()
+            self.vars_cuentas[key] = var
+            entry = ttk.Entry(frame_grid, textvariable=var, width=12)
+            entry.grid(row=i, column=1, pady=5, sticky='w')
+            ttk.Label(frame_grid, text=f"(ej: {ejemplo})", foreground='gray').grid(row=i, column=2, padx=(10, 0))
+
+        # === Notas ===
+        frame_notas = ttk.LabelFrame(main, text="Notas", padding=5)
+        frame_notas.pack(fill='x', pady=(0, 15))
+
+        self.text_notas = tk.Text(frame_notas, height=3, width=50)
+        self.text_notas.pack(fill='x')
+
+        # === Botones ===
+        frame_btns = ttk.Frame(main)
+        frame_btns.pack(fill='x')
+
+        ttk.Button(frame_btns, text="💾 Guardar",
+                  command=self._guardar).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_btns, text="🔄 Cargar desde defaults",
+                  command=self._cargar_defaults).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_btns, text="📋 Cargar desde plan de cuentas",
+                  command=self._cargar_plan_cuentas).pack(side='left')
+
+        ttk.Button(frame_btns, text="Cancelar",
+                  command=self.destroy).pack(side='right')
+
+    def _cargar_valores(self):
+        """Carga los valores actuales de la configuración"""
+        cuentas = self.config_empresa.obtener_cuentas(self.cif)
+
+        if cuentas:
+            for key, var in self.vars_cuentas.items():
+                var.set(cuentas.get(key, ''))
+        else:
+            # Cargar desde defaults globales
+            for key, var in self.vars_cuentas.items():
+                var.set(self.config_global.get_cuenta(key))
+
+        # Cargar notas
+        info = self.config_empresa.obtener_info_empresa(self.cif)
+        if info and info.get('notas'):
+            self.text_notas.insert('1.0', info['notas'])
+
+    def _cargar_defaults(self):
+        """Carga los valores por defecto globales"""
+        for key, var in self.vars_cuentas.items():
+            var.set(self.config_global.get_cuenta(key))
+
+    def _cargar_plan_cuentas(self):
+        """Intenta cargar cuentas desde el plan de cuentas de la empresa"""
+        if not self.codigo_empresa:
+            messagebox.showwarning("Aviso", "No se ha especificado el código de empresa")
+            return
+
+        db = DatabaseManager()
+        cuentas = db.obtener_plan_cuentas(self.codigo_empresa, '64%')
+
+        if not cuentas:
+            messagebox.showinfo("Info", "No se encontraron cuentas de nóminas (64x) en el plan de cuentas")
+            return
+
+        # Mostrar diálogo para seleccionar cuentas
+        self._dialogo_seleccionar_cuentas(cuentas)
+
+    def _dialogo_seleccionar_cuentas(self, cuentas):
+        """Diálogo para seleccionar cuentas del plan"""
+        dialogo = tk.Toplevel(self)
+        dialogo.title("Seleccionar cuentas del plan")
+        dialogo.geometry("500x400")
+        dialogo.transient(self)
+        dialogo.grab_set()
+
+        frame = ttk.Frame(dialogo, padding=10)
+        frame.pack(fill='both', expand=True)
+
+        ttk.Label(frame, text="Cuentas encontradas en el plan de cuentas:",
+                 font=('Arial', 10, 'bold')).pack(anchor='w')
+
+        # Lista de cuentas
+        frame_lista = ttk.Frame(frame)
+        frame_lista.pack(fill='both', expand=True, pady=10)
+
+        lista = tk.Listbox(frame_lista, height=15, width=50)
+        scroll = ttk.Scrollbar(frame_lista, orient='vertical', command=lista.yview)
+        lista.configure(yscrollcommand=scroll.set)
+
+        for c in cuentas:
+            lista.insert('end', f"{c['cuenta']} - {c['nombre']}")
+
+        scroll.pack(side='right', fill='y')
+        lista.pack(fill='both', expand=True)
+
+        ttk.Label(frame, text="Doble clic en una cuenta para copiar el código").pack(anchor='w')
+
+        def copiar_cuenta(event):
+            sel = lista.curselection()
+            if sel:
+                cuenta = cuentas[sel[0]]['cuenta']
+                self.clipboard_clear()
+                self.clipboard_append(cuenta)
+                messagebox.showinfo("Copiado", f"Cuenta {cuenta} copiada al portapapeles")
+
+        lista.bind('<Double-1>', copiar_cuenta)
+
+        ttk.Button(frame, text="Cerrar", command=dialogo.destroy).pack(pady=10)
+
+    def _guardar(self):
+        """Guarda la configuración"""
+        cuentas = {}
+        for key, var in self.vars_cuentas.items():
+            valor = var.get().strip()
+            if valor:
+                cuentas[key] = valor
+
+        # Actualizar configuración
+        if not self.config_empresa.existe_configuracion(self.cif):
+            self.config_empresa.crear_configuracion(
+                self.cif, self.nombre_empresa, self.codigo_empresa
+            )
+
+        self.config_empresa.actualizar_cuentas(self.cif, cuentas)
+
+        # Guardar notas
+        notas = self.text_notas.get('1.0', 'end-1c')
+        info = self.config_empresa.obtener_info_empresa(self.cif)
+        if info:
+            info['notas'] = notas
+            self.config_empresa._guardar_empresa(self.cif)
+
+        messagebox.showinfo("Éxito", f"Configuración guardada para {self.nombre_empresa or self.cif}")
+        self.logger.info(f"Cuentas de empresa guardadas: {self.cif}")
+
+        if self.callback_guardado:
+            self.callback_guardado(cuentas)
+
+        self.destroy()
 
 
 # =============================================================================
