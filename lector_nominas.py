@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-LECTOR DE NÓMINAS - FASE 3.5: OpenDataLoader + Sistema Inteligente
-Versión: 3.5.0
-Fecha: 2026-04-07
+LECTOR DE NÓMINAS - FASE 4: Proceso Masivo de Documentos
+Versión: 4.0.0
+Fecha: 2026-04-08
 Autor: Claude para Jurado Asesores Tributarios - 2026
 
 FUNCIONALIDADES FASE 1:
@@ -29,16 +29,24 @@ FUNCIONALIDADES FASE 3:
 - Mapeo automático a cuentas contables
 - Mejora continua con cada corrección del usuario
 
-FUNCIONALIDADES FASE 3.5 (NUEVA):
+FUNCIONALIDADES FASE 3.5:
 - Integración con OpenDataLoader PDF (precisión 0.907)
 - Extracción avanzada de tablas con bounding boxes
 - OCR mejorado con 80+ idiomas
 - Detección de estructura basada en coordenadas
 - Fallback a PyMuPDF si OpenDataLoader no disponible
+
+FUNCIONALIDADES FASE 4 (NUEVA):
+- Proceso masivo de múltiples PDFs
+- Cola de procesamiento con progreso visual
+- Tabla de resultados con estado por documento
+- Exportación a Excel/CSV
+- Generación masiva de asientos contables
+- Resumen estadístico del proceso
 """
 
-VERSION = "3.5.0"
-VERSION_FECHA = "2026-04-07"
+VERSION = "4.0.0"
+VERSION_FECHA = "2026-04-08"
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -1881,7 +1889,8 @@ class AplicacionFase3:
                                        font=('Arial', 10), foreground='gray')
         self.label_errores.pack(side='left', padx=(0, 10))
 
-        ttk.Button(frame_log, text="📋 Ver Log", command=self._abrir_log).pack(side='left')
+        ttk.Button(frame_log, text="📋 Ver Log", command=self._abrir_log).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_log, text="📦 Proceso Masivo", command=self._abrir_proceso_masivo).pack(side='left')
 
         # === FRAME PRINCIPAL ===
         main = ttk.Frame(self.root, padding=10)
@@ -2054,6 +2063,10 @@ class AplicacionFase3:
     def _abrir_log(self):
         """Abre la ventana de log"""
         VentanaLog(self.root)
+
+    def _abrir_proceso_masivo(self):
+        """Abre la ventana de proceso masivo"""
+        VentanaProcesoMasivo(self.root, self.db, self.gestor_plantillas)
 
     def _verificar_bd(self):
         """Verifica conexión a BD en segundo plano"""
@@ -2412,6 +2425,541 @@ class AplicacionFase3:
         ttk.Button(frame_btns, text="✏️ Editar", command=editar).pack(side='left', padx=(0, 5))
         ttk.Button(frame_btns, text="🗑️ Eliminar", command=eliminar).pack(side='left')
         ttk.Button(frame_btns, text="Cerrar", command=ventana.destroy).pack(side='right')
+
+
+# =============================================================================
+# CLASE: VentanaProcesoMasivo (Procesamiento por lotes)
+# =============================================================================
+class VentanaProcesoMasivo(tk.Toplevel):
+    """Ventana para procesar múltiples PDFs en lote"""
+
+    # Estados de procesamiento
+    ESTADO_PENDIENTE = "⏳ Pendiente"
+    ESTADO_PROCESANDO = "🔄 Procesando"
+    ESTADO_OK = "✅ Completado"
+    ESTADO_ERROR = "❌ Error"
+    ESTADO_SIN_CIF = "⚠️ Sin CIF"
+
+    def __init__(self, parent, db_manager, gestor_plantillas):
+        super().__init__(parent)
+        self.title("Proceso Masivo de Documentos")
+        self.geometry("1200x700")
+        self.minsize(900, 500)
+
+        self.db = db_manager
+        self.gestor_plantillas = gestor_plantillas
+        self.logger = Logger()
+        self.detector = DetectorDocumento()
+        self.extractor = ExtractorConceptos()
+
+        # Cola de archivos a procesar
+        self.archivos = []  # Lista de {ruta, estado, pdf, empresa, conceptos, error}
+        self.procesando = False
+        self.cancelar = False
+
+        # Queue para actualizaciones de UI
+        self.queue = Queue()
+
+        self._crear_ui()
+        self._iniciar_actualizador()
+
+    def _crear_ui(self):
+        # Frame principal
+        main = ttk.Frame(self, padding=10)
+        main.pack(fill='both', expand=True)
+
+        # === Panel superior: Controles ===
+        frame_controles = ttk.LabelFrame(main, text="Controles", padding=10)
+        frame_controles.pack(fill='x', pady=(0, 10))
+
+        # Botones de carga
+        frame_btns = ttk.Frame(frame_controles)
+        frame_btns.pack(fill='x')
+
+        ttk.Button(frame_btns, text="📁 Añadir archivos",
+                  command=self._añadir_archivos).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_btns, text="📂 Añadir carpeta",
+                  command=self._añadir_carpeta).pack(side='left', padx=(0, 5))
+        ttk.Button(frame_btns, text="🗑️ Limpiar lista",
+                  command=self._limpiar_lista).pack(side='left', padx=(0, 20))
+
+        # Botones de procesamiento
+        self.btn_procesar = ttk.Button(frame_btns, text="▶️ Procesar todos",
+                                       command=self._iniciar_proceso)
+        self.btn_procesar.pack(side='left', padx=(0, 5))
+
+        self.btn_cancelar = ttk.Button(frame_btns, text="⏹️ Cancelar",
+                                       command=self._cancelar_proceso, state='disabled')
+        self.btn_cancelar.pack(side='left', padx=(0, 20))
+
+        # Exportación
+        ttk.Button(frame_btns, text="📊 Exportar Excel",
+                  command=self._exportar_excel).pack(side='right', padx=(5, 0))
+        ttk.Button(frame_btns, text="📄 Exportar CSV",
+                  command=self._exportar_csv).pack(side='right', padx=(5, 0))
+
+        # Progreso general
+        frame_progreso = ttk.Frame(frame_controles)
+        frame_progreso.pack(fill='x', pady=(10, 0))
+
+        self.var_progreso_texto = tk.StringVar(value="Sin archivos cargados")
+        ttk.Label(frame_progreso, textvariable=self.var_progreso_texto).pack(side='left')
+
+        self.progreso = ttk.Progressbar(frame_progreso, length=300, mode='determinate')
+        self.progreso.pack(side='right')
+
+        # === Panel central: Tabla de archivos ===
+        frame_tabla = ttk.LabelFrame(main, text="Documentos", padding=5)
+        frame_tabla.pack(fill='both', expand=True, pady=(0, 10))
+
+        # Treeview con columnas
+        columnas = ('archivo', 'estado', 'cif', 'empresa', 'periodo', 'conceptos', 'total')
+        self.tree = ttk.Treeview(frame_tabla, columns=columnas, show='headings', height=15)
+
+        # Configurar columnas
+        self.tree.heading('archivo', text='Archivo')
+        self.tree.heading('estado', text='Estado')
+        self.tree.heading('cif', text='CIF')
+        self.tree.heading('empresa', text='Empresa')
+        self.tree.heading('periodo', text='Período')
+        self.tree.heading('conceptos', text='Conceptos')
+        self.tree.heading('total', text='Total Neto')
+
+        self.tree.column('archivo', width=250)
+        self.tree.column('estado', width=100, anchor='center')
+        self.tree.column('cif', width=100, anchor='center')
+        self.tree.column('empresa', width=200)
+        self.tree.column('periodo', width=100, anchor='center')
+        self.tree.column('conceptos', width=80, anchor='center')
+        self.tree.column('total', width=100, anchor='e')
+
+        # Scrollbars
+        scroll_y = ttk.Scrollbar(frame_tabla, orient='vertical', command=self.tree.yview)
+        scroll_x = ttk.Scrollbar(frame_tabla, orient='horizontal', command=self.tree.xview)
+        self.tree.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+
+        scroll_y.pack(side='right', fill='y')
+        scroll_x.pack(side='bottom', fill='x')
+        self.tree.pack(fill='both', expand=True)
+
+        # Doble clic para ver detalles
+        self.tree.bind('<Double-1>', self._ver_detalles)
+
+        # === Panel inferior: Resumen ===
+        frame_resumen = ttk.LabelFrame(main, text="Resumen", padding=10)
+        frame_resumen.pack(fill='x')
+
+        # Estadísticas
+        frame_stats = ttk.Frame(frame_resumen)
+        frame_stats.pack(fill='x')
+
+        self.var_total = tk.StringVar(value="Total: 0")
+        self.var_ok = tk.StringVar(value="✅ Completados: 0")
+        self.var_errores = tk.StringVar(value="❌ Errores: 0")
+        self.var_sin_cif = tk.StringVar(value="⚠️ Sin CIF: 0")
+        self.var_suma_netos = tk.StringVar(value="💰 Suma netos: 0.00 €")
+
+        ttk.Label(frame_stats, textvariable=self.var_total, font=('Arial', 10, 'bold')).pack(side='left', padx=(0, 20))
+        ttk.Label(frame_stats, textvariable=self.var_ok, foreground='green').pack(side='left', padx=(0, 20))
+        ttk.Label(frame_stats, textvariable=self.var_errores, foreground='red').pack(side='left', padx=(0, 20))
+        ttk.Label(frame_stats, textvariable=self.var_sin_cif, foreground='orange').pack(side='left', padx=(0, 20))
+        ttk.Label(frame_stats, textvariable=self.var_suma_netos, font=('Arial', 10, 'bold')).pack(side='right')
+
+    def _iniciar_actualizador(self):
+        """Procesa actualizaciones de UI desde el hilo de procesamiento"""
+        try:
+            while True:
+                callback = self.queue.get_nowait()
+                callback()
+        except Empty:
+            pass
+        self.after(100, self._iniciar_actualizador)
+
+    def _añadir_archivos(self):
+        """Añade archivos PDF individuales"""
+        rutas = filedialog.askopenfilenames(
+            title="Seleccionar PDFs",
+            filetypes=[("Archivos PDF", "*.pdf")]
+        )
+        for ruta in rutas:
+            self._añadir_archivo(ruta)
+        self._actualizar_resumen()
+
+    def _añadir_carpeta(self):
+        """Añade todos los PDFs de una carpeta"""
+        carpeta = filedialog.askdirectory(title="Seleccionar carpeta con PDFs")
+        if carpeta:
+            for archivo in Path(carpeta).glob("*.pdf"):
+                self._añadir_archivo(str(archivo))
+            for archivo in Path(carpeta).glob("*.PDF"):
+                self._añadir_archivo(str(archivo))
+        self._actualizar_resumen()
+
+    def _añadir_archivo(self, ruta):
+        """Añade un archivo a la lista si no existe"""
+        # Verificar que no esté duplicado
+        for item in self.archivos:
+            if item['ruta'] == ruta:
+                return
+
+        nombre = os.path.basename(ruta)
+        item = {
+            'ruta': ruta,
+            'nombre': nombre,
+            'estado': self.ESTADO_PENDIENTE,
+            'pdf': None,
+            'empresa': None,
+            'conceptos': [],
+            'total_neto': None,
+            'error': None
+        }
+        self.archivos.append(item)
+
+        # Añadir a la tabla
+        self.tree.insert('', 'end', iid=ruta, values=(
+            nombre, self.ESTADO_PENDIENTE, '-', '-', '-', '-', '-'
+        ))
+
+    def _limpiar_lista(self):
+        """Limpia la lista de archivos"""
+        if self.procesando:
+            messagebox.showwarning("Aviso", "Espere a que termine el proceso actual")
+            return
+
+        self.archivos = []
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self._actualizar_resumen()
+
+    def _iniciar_proceso(self):
+        """Inicia el procesamiento de todos los archivos"""
+        if not self.archivos:
+            messagebox.showwarning("Aviso", "No hay archivos para procesar")
+            return
+
+        self.procesando = True
+        self.cancelar = False
+        self.btn_procesar.configure(state='disabled')
+        self.btn_cancelar.configure(state='normal')
+
+        threading.Thread(target=self._procesar_cola, daemon=True).start()
+
+    def _cancelar_proceso(self):
+        """Cancela el procesamiento"""
+        self.cancelar = True
+        self.btn_cancelar.configure(state='disabled')
+
+    def _procesar_cola(self):
+        """Procesa la cola de archivos en segundo plano"""
+        total = len(self.archivos)
+
+        for i, item in enumerate(self.archivos):
+            if self.cancelar:
+                self.logger.warning("Proceso masivo cancelado por el usuario")
+                break
+
+            # Actualizar progreso
+            self.queue.put(lambda idx=i, tot=total: self._actualizar_progreso(idx, tot))
+
+            # Saltar si ya está procesado
+            if item['estado'] == self.ESTADO_OK:
+                continue
+
+            # Marcar como procesando
+            item['estado'] = self.ESTADO_PROCESANDO
+            self.queue.put(lambda r=item['ruta']: self._actualizar_fila(r))
+
+            try:
+                # Procesar PDF
+                pdf = PDFProcessor(item['ruta'])
+                ok, msg = pdf.procesar_automatico()
+
+                if not ok:
+                    raise Exception(msg)
+
+                item['pdf'] = pdf
+
+                # Buscar empresa
+                if pdf.cif:
+                    empresa = self.db.buscar_empresa_por_cif(pdf.cif)
+                    item['empresa'] = empresa
+
+                # Detectar plantilla y extraer conceptos
+                plantilla, _ = self.detector.buscar_plantilla(pdf.texto)
+                conceptos = self.extractor.extraer(pdf.texto, plantilla, pdf)
+                if plantilla:
+                    conceptos = self.extractor.mapear_a_cuentas(conceptos, plantilla)
+                item['conceptos'] = conceptos
+
+                # Calcular total neto
+                for c in conceptos:
+                    if c.get('concepto') and ('NETO' in c['concepto'] or 'LÍQUIDO' in c['concepto']):
+                        item['total_neto'] = c.get('importe')
+                        break
+
+                # Determinar estado final
+                if not pdf.cif:
+                    item['estado'] = self.ESTADO_SIN_CIF
+                else:
+                    item['estado'] = self.ESTADO_OK
+
+            except Exception as e:
+                item['estado'] = self.ESTADO_ERROR
+                item['error'] = str(e)
+                self.logger.error(f"Error procesando {item['nombre']}", str(e))
+
+            # Actualizar fila
+            self.queue.put(lambda r=item['ruta']: self._actualizar_fila(r))
+
+        # Finalizar
+        self.queue.put(self._finalizar_proceso)
+
+    def _actualizar_progreso(self, actual, total):
+        """Actualiza la barra de progreso"""
+        pct = int(((actual + 1) / total) * 100)
+        self.progreso['value'] = pct
+        self.var_progreso_texto.set(f"Procesando {actual + 1} de {total}...")
+
+    def _actualizar_fila(self, ruta):
+        """Actualiza una fila en la tabla"""
+        item = next((x for x in self.archivos if x['ruta'] == ruta), None)
+        if not item:
+            return
+
+        pdf = item.get('pdf')
+        empresa = item.get('empresa')
+        conceptos = item.get('conceptos', [])
+        total_neto = item.get('total_neto')
+
+        valores = (
+            item['nombre'],
+            item['estado'],
+            pdf.cif if pdf else '-',
+            empresa['nombre'][:30] if empresa else '-',
+            pdf.periodo if pdf else '-',
+            str(len(conceptos)),
+            f"{total_neto:,.2f} €".replace(',', 'X').replace('.', ',').replace('X', '.') if total_neto else '-'
+        )
+
+        self.tree.item(ruta, values=valores)
+        self._actualizar_resumen()
+
+    def _finalizar_proceso(self):
+        """Finaliza el proceso y actualiza UI"""
+        self.procesando = False
+        self.btn_procesar.configure(state='normal')
+        self.btn_cancelar.configure(state='disabled')
+
+        if self.cancelar:
+            self.var_progreso_texto.set("Proceso cancelado")
+        else:
+            self.var_progreso_texto.set("Proceso completado")
+            self.progreso['value'] = 100
+
+        self._actualizar_resumen()
+        self.logger.info("Proceso masivo completado", f"Total: {len(self.archivos)} archivos")
+
+    def _actualizar_resumen(self):
+        """Actualiza las estadísticas del resumen"""
+        total = len(self.archivos)
+        ok = sum(1 for x in self.archivos if x['estado'] == self.ESTADO_OK)
+        errores = sum(1 for x in self.archivos if x['estado'] == self.ESTADO_ERROR)
+        sin_cif = sum(1 for x in self.archivos if x['estado'] == self.ESTADO_SIN_CIF)
+
+        suma_netos = sum(x.get('total_neto', 0) or 0 for x in self.archivos)
+
+        self.var_total.set(f"Total: {total}")
+        self.var_ok.set(f"✅ Completados: {ok}")
+        self.var_errores.set(f"❌ Errores: {errores}")
+        self.var_sin_cif.set(f"⚠️ Sin CIF: {sin_cif}")
+        self.var_suma_netos.set(f"💰 Suma netos: {suma_netos:,.2f} €".replace(',', 'X').replace('.', ',').replace('X', '.'))
+
+    def _ver_detalles(self, event):
+        """Muestra detalles del documento seleccionado"""
+        sel = self.tree.selection()
+        if not sel:
+            return
+
+        ruta = sel[0]
+        item = next((x for x in self.archivos if x['ruta'] == ruta), None)
+        if not item:
+            return
+
+        # Crear ventana de detalles
+        ventana = tk.Toplevel(self)
+        ventana.title(f"Detalles: {item['nombre']}")
+        ventana.geometry("600x500")
+
+        frame = ttk.Frame(ventana, padding=10)
+        frame.pack(fill='both', expand=True)
+
+        # Info básica
+        ttk.Label(frame, text=f"Archivo: {item['nombre']}", font=('Arial', 11, 'bold')).pack(anchor='w')
+        ttk.Label(frame, text=f"Estado: {item['estado']}").pack(anchor='w')
+
+        if item.get('error'):
+            ttk.Label(frame, text=f"Error: {item['error']}", foreground='red', wraplength=550).pack(anchor='w', pady=(5, 0))
+
+        pdf = item.get('pdf')
+        if pdf:
+            ttk.Separator(frame, orient='horizontal').pack(fill='x', pady=10)
+            ttk.Label(frame, text=f"CIF: {pdf.cif or 'No detectado'}").pack(anchor='w')
+            ttk.Label(frame, text=f"Período: {pdf.periodo or 'No detectado'}").pack(anchor='w')
+            ttk.Label(frame, text=f"Páginas: {pdf.num_paginas}").pack(anchor='w')
+            ttk.Label(frame, text=f"Método: {pdf.metodo_extraccion}").pack(anchor='w')
+
+        empresa = item.get('empresa')
+        if empresa:
+            ttk.Separator(frame, orient='horizontal').pack(fill='x', pady=10)
+            ttk.Label(frame, text="Empresa:", font=('Arial', 10, 'bold')).pack(anchor='w')
+            ttk.Label(frame, text=f"  Nombre: {empresa['nombre']}").pack(anchor='w')
+            ttk.Label(frame, text=f"  Código: {empresa['codigo']}").pack(anchor='w')
+
+        conceptos = item.get('conceptos', [])
+        if conceptos:
+            ttk.Separator(frame, orient='horizontal').pack(fill='x', pady=10)
+            ttk.Label(frame, text=f"Conceptos extraídos ({len(conceptos)}):", font=('Arial', 10, 'bold')).pack(anchor='w')
+
+            # Lista de conceptos
+            lista = tk.Listbox(frame, height=10)
+            for c in conceptos:
+                importe = c.get('importe')
+                importe_str = f"{importe:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.') if importe else '-'
+                cuenta = c.get('cuenta', '-')
+                lista.insert('end', f"{c['concepto']}: {importe_str} € → {cuenta}")
+            lista.pack(fill='both', expand=True, pady=(5, 0))
+
+        ttk.Button(frame, text="Cerrar", command=ventana.destroy).pack(pady=(10, 0))
+
+    def _exportar_csv(self):
+        """Exporta los resultados a CSV"""
+        if not self.archivos:
+            messagebox.showwarning("Aviso", "No hay datos para exportar")
+            return
+
+        ruta = filedialog.asksaveasfilename(
+            title="Guardar CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")]
+        )
+        if not ruta:
+            return
+
+        try:
+            with open(ruta, 'w', encoding='utf-8-sig') as f:
+                # Encabezados
+                f.write("Archivo;Estado;CIF;Empresa;Período;Conceptos;Total Neto\n")
+
+                for item in self.archivos:
+                    pdf = item.get('pdf')
+                    empresa = item.get('empresa')
+                    total = item.get('total_neto')
+
+                    f.write(f"{item['nombre']};")
+                    f.write(f"{item['estado']};")
+                    f.write(f"{pdf.cif if pdf else ''};")
+                    f.write(f"{empresa['nombre'] if empresa else ''};")
+                    f.write(f"{pdf.periodo if pdf else ''};")
+                    f.write(f"{len(item.get('conceptos', []))};")
+                    f.write(f"{total if total else ''}\n")
+
+            messagebox.showinfo("Éxito", f"CSV exportado: {ruta}")
+            self.logger.info(f"CSV exportado: {ruta}")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Error exportando CSV: {e}")
+
+    def _exportar_excel(self):
+        """Exporta los resultados a Excel"""
+        if not self.archivos:
+            messagebox.showwarning("Aviso", "No hay datos para exportar")
+            return
+
+        try:
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill, Alignment
+        except ImportError:
+            messagebox.showwarning("Aviso", "Instalando openpyxl...")
+            import subprocess
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'openpyxl', '-q'])
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill, Alignment
+
+        ruta = filedialog.asksaveasfilename(
+            title="Guardar Excel",
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx")]
+        )
+        if not ruta:
+            return
+
+        try:
+            wb = openpyxl.Workbook()
+
+            # === Hoja 1: Resumen ===
+            ws = wb.active
+            ws.title = "Resumen"
+
+            # Encabezados
+            headers = ["Archivo", "Estado", "CIF", "Empresa", "Período", "Conceptos", "Total Neto"]
+            header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+            header_font = Font(color="FFFFFF", bold=True)
+
+            for col, header in enumerate(headers, 1):
+                cell = ws.cell(row=1, column=col, value=header)
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal='center')
+
+            # Datos
+            for row, item in enumerate(self.archivos, 2):
+                pdf = item.get('pdf')
+                empresa = item.get('empresa')
+                total = item.get('total_neto')
+
+                ws.cell(row=row, column=1, value=item['nombre'])
+                ws.cell(row=row, column=2, value=item['estado'])
+                ws.cell(row=row, column=3, value=pdf.cif if pdf else '')
+                ws.cell(row=row, column=4, value=empresa['nombre'] if empresa else '')
+                ws.cell(row=row, column=5, value=pdf.periodo if pdf else '')
+                ws.cell(row=row, column=6, value=len(item.get('conceptos', [])))
+                ws.cell(row=row, column=7, value=total if total else 0)
+
+            # Ajustar anchos
+            ws.column_dimensions['A'].width = 35
+            ws.column_dimensions['B'].width = 15
+            ws.column_dimensions['C'].width = 12
+            ws.column_dimensions['D'].width = 30
+            ws.column_dimensions['E'].width = 15
+            ws.column_dimensions['F'].width = 12
+            ws.column_dimensions['G'].width = 15
+
+            # === Hoja 2: Conceptos detallados ===
+            ws2 = wb.create_sheet("Conceptos")
+            headers2 = ["Archivo", "Concepto", "Importe", "Cuenta", "Tipo", "Descripción"]
+
+            for col, header in enumerate(headers2, 1):
+                cell = ws2.cell(row=1, column=col, value=header)
+                cell.fill = header_fill
+                cell.font = header_font
+
+            row = 2
+            for item in self.archivos:
+                for c in item.get('conceptos', []):
+                    ws2.cell(row=row, column=1, value=item['nombre'])
+                    ws2.cell(row=row, column=2, value=c.get('concepto', ''))
+                    ws2.cell(row=row, column=3, value=c.get('importe'))
+                    ws2.cell(row=row, column=4, value=c.get('cuenta', ''))
+                    ws2.cell(row=row, column=5, value=c.get('tipo', ''))
+                    ws2.cell(row=row, column=6, value=c.get('descripcion', ''))
+                    row += 1
+
+            wb.save(ruta)
+            messagebox.showinfo("Éxito", f"Excel exportado: {ruta}")
+            self.logger.info(f"Excel exportado: {ruta}")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Error exportando Excel: {e}")
 
 
 # =============================================================================
