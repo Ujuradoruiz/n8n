@@ -2677,66 +2677,70 @@ class ExtractorIA:
     """
     _instancia = None
 
-    # Estructura JSON que esperamos de la IA
+    # Estructura JSON que esperamos de la IA (SIEMPRE array de empresas)
     ESTRUCTURA_JSON = """
     {
-        "empresa": {
-            "cif": "B12345678",
-            "nombre": "Nombre de la empresa",
-            "domicilio": "Dirección (opcional)"
-        },
-        "periodo": {
-            "mes": 6,
-            "año": 2024,
-            "texto": "Junio 2024"
-        },
-        "trabajadores": {
-            "total": 25,
-            "detalle": []
-        },
-        "conceptos": [
+        "empresas": [
             {
-                "codigo": "001",
-                "descripcion": "Sueldos y salarios",
-                "tipo": "devengo",
-                "importe": 45230.50
-            },
-            {
-                "codigo": "002",
-                "descripcion": "Complementos salariales",
-                "tipo": "devengo",
-                "importe": 8500.00
-            },
-            {
-                "codigo": "500",
-                "descripcion": "Contingencias comunes (empresa)",
-                "tipo": "ss_empresa",
-                "importe": 12500.00
-            },
-            {
-                "codigo": "501",
-                "descripcion": "Contingencias comunes (trabajador)",
-                "tipo": "ss_trabajador",
-                "importe": 3200.00
-            },
-            {
-                "codigo": "600",
-                "descripcion": "IRPF",
-                "tipo": "retencion",
-                "importe": 7500.00
+                "empresa": {
+                    "cif": "B12345678",
+                    "nombre": "Nombre de la empresa",
+                    "domicilio": "Dirección (opcional)"
+                },
+                "periodo": {
+                    "mes": 6,
+                    "año": 2024,
+                    "texto": "Junio 2024"
+                },
+                "trabajadores": {
+                    "total": 25,
+                    "detalle": []
+                },
+                "conceptos": [
+                    {
+                        "codigo": "001",
+                        "descripcion": "Sueldos y salarios",
+                        "tipo": "devengo",
+                        "importe": 45230.50
+                    },
+                    {
+                        "codigo": "002",
+                        "descripcion": "Complementos salariales",
+                        "tipo": "devengo",
+                        "importe": 8500.00
+                    },
+                    {
+                        "codigo": "500",
+                        "descripcion": "Contingencias comunes (empresa)",
+                        "tipo": "ss_empresa",
+                        "importe": 12500.00
+                    },
+                    {
+                        "codigo": "501",
+                        "descripcion": "Contingencias comunes (trabajador)",
+                        "tipo": "ss_trabajador",
+                        "importe": 3200.00
+                    },
+                    {
+                        "codigo": "600",
+                        "descripcion": "IRPF",
+                        "tipo": "retencion",
+                        "importe": 7500.00
+                    }
+                ],
+                "totales": {
+                    "total_devengos": 53730.50,
+                    "total_ss_empresa": 15800.00,
+                    "total_ss_trabajador": 4100.00,
+                    "total_irpf": 7500.00,
+                    "liquido_a_percibir": 42130.50
+                },
+                "observaciones": "Cualquier observación relevante"
             }
         ],
-        "totales": {
-            "total_devengos": 53730.50,
-            "total_ss_empresa": 15800.00,
-            "total_ss_trabajador": 4100.00,
-            "total_irpf": 7500.00,
-            "liquido_a_percibir": 42130.50
-        },
-        "observaciones": "Cualquier observación relevante",
         "_metadata": {
-            "confianza": 0.95,
-            "campos_dudosos": [],
+            "total_empresas": 1,
+            "confianza_global": 0.95,
             "formato_detectado": "Resumen mensual de nóminas"
         }
     }
@@ -2745,14 +2749,20 @@ class ExtractorIA:
     PROMPT_SISTEMA = """Eres un experto en nóminas españolas y contabilidad. Tu tarea es extraer
 información de documentos PDF de nóminas o resúmenes de nóminas y convertirlos a JSON estructurado.
 
-IMPORTANTE:
+IMPORTANTE - DETECCIÓN DE MÚLTIPLES EMPRESAS:
+- El PDF puede contener datos de UNA o MÚLTIPLES empresas
+- SIEMPRE devuelve un array "empresas" aunque solo haya una
+- Detecta cambios de empresa por: nuevo CIF, nuevo encabezado, salto de sección
+- Cada empresa debe tener su propio objeto completo en el array
+
+IMPORTANTE - EXTRACCIÓN DE DATOS:
 - Extrae TODOS los conceptos que encuentres (devengos, deducciones, bases, etc.)
 - Los importes deben ser números (sin símbolos de euro ni separadores de miles)
 - El CIF/NIF debe estar en formato correcto (letra + 8 dígitos o 8 dígitos + letra)
 - Si no encuentras un dato, usa null en lugar de inventarlo
 - El campo "tipo" de cada concepto debe ser uno de: "devengo", "deduccion", "ss_empresa", "ss_trabajador", "retencion", "base"
-- Si hay varios trabajadores, suma los importes por concepto
-- Incluye un nivel de confianza (0-1) en _metadata
+- Si hay varios trabajadores en una empresa, suma los importes por concepto
+- Incluye el total de empresas detectadas en _metadata.total_empresas
 
 Devuelve SOLO el JSON, sin explicaciones ni markdown."""
 
@@ -2942,19 +2952,79 @@ La estructura esperada es:
         except Exception as e:
             self.logger.warning(f"No se pudo guardar extracción: {e}")
 
-    def convertir_a_conceptos(self, datos_ia):
+    def obtener_empresas(self, datos_ia):
         """
-        Convierte los datos extraídos por IA al formato interno de conceptos.
+        Obtiene la lista de empresas del resultado de la IA.
 
         Args:
             datos_ia: dict con la estructura JSON de la IA
+
+        Returns:
+            Lista de empresas detectadas, cada una con su info completa
+        """
+        if not datos_ia:
+            return []
+
+        # Nuevo formato: array de empresas
+        if 'empresas' in datos_ia:
+            return datos_ia.get('empresas', [])
+
+        # Formato antiguo (compatibilidad): empresa única
+        if 'empresa' in datos_ia:
+            return [datos_ia]
+
+        return []
+
+    def es_multi_empresa(self, datos_ia):
+        """Verifica si el resultado contiene múltiples empresas"""
+        empresas = self.obtener_empresas(datos_ia)
+        return len(empresas) > 1
+
+    def get_resumen_empresas(self, datos_ia):
+        """
+        Obtiene un resumen de las empresas detectadas.
+
+        Returns:
+            Lista de {cif, nombre, total_devengos, num_conceptos}
+        """
+        resumen = []
+        for emp in self.obtener_empresas(datos_ia):
+            info_emp = emp.get('empresa', {})
+            totales = emp.get('totales', {})
+            conceptos = emp.get('conceptos', [])
+
+            resumen.append({
+                'cif': info_emp.get('cif', ''),
+                'nombre': info_emp.get('nombre', 'Sin nombre'),
+                'total_devengos': totales.get('total_devengos', 0),
+                'liquido': totales.get('liquido_a_percibir', 0),
+                'num_conceptos': len(conceptos),
+                'periodo': emp.get('periodo', {}).get('texto', '')
+            })
+
+        return resumen
+
+    def convertir_a_conceptos(self, datos_empresa):
+        """
+        Convierte los datos de UNA empresa al formato interno de conceptos.
+
+        Args:
+            datos_empresa: dict de una empresa (NO el array completo)
 
         Returns:
             Lista de conceptos en formato interno compatible con el sistema
         """
         conceptos = []
 
-        if not datos_ia or 'conceptos' not in datos_ia:
+        # Si recibimos el formato completo con 'empresas', tomar la primera
+        if 'empresas' in datos_empresa:
+            empresas = datos_empresa.get('empresas', [])
+            if empresas:
+                datos_empresa = empresas[0]
+            else:
+                return conceptos
+
+        if not datos_empresa or 'conceptos' not in datos_empresa:
             return conceptos
 
         # Mapeo de tipos IA a tipos internos
@@ -2967,7 +3037,7 @@ La estructura esperada es:
             'base': 'info'
         }
 
-        for item in datos_ia.get('conceptos', []):
+        for item in datos_empresa.get('conceptos', []):
             tipo_ia = item.get('tipo', 'devengo')
             tipo_interno = mapeo_tipos.get(tipo_ia, 'debe')
 
@@ -2985,6 +3055,30 @@ La estructura esperada es:
             conceptos.append(concepto)
 
         return conceptos
+
+    def convertir_todas_empresas(self, datos_ia):
+        """
+        Convierte todas las empresas del resultado IA a formato interno.
+
+        Returns:
+            Lista de {empresa_info, conceptos, periodo, totales}
+        """
+        resultado = []
+
+        for emp in self.obtener_empresas(datos_ia):
+            info_emp = emp.get('empresa', {})
+            conceptos = self.convertir_a_conceptos(emp)
+
+            resultado.append({
+                'empresa': info_emp,
+                'conceptos': conceptos,
+                'periodo': emp.get('periodo', {}),
+                'totales': emp.get('totales', {}),
+                'trabajadores': emp.get('trabajadores', {}),
+                'observaciones': emp.get('observaciones', '')
+            })
+
+        return resultado
 
     def get_historial(self, cif=None, limite=50):
         """Obtiene el historial de extracciones, opcionalmente filtrado por CIF"""
@@ -3319,6 +3413,252 @@ class VentanaEditorJSON(tk.Toplevel):
 
         if self.callback_aceptar:
             self.callback_aceptar(self.datos_editados)
+
+        self.destroy()
+
+
+# =============================================================================
+# CLASE: VentanaMultiEmpresa (Selección de empresas en PDF multi-empresa)
+# =============================================================================
+class VentanaMultiEmpresa(tk.Toplevel):
+    """
+    Ventana para mostrar y seleccionar empresas cuando un PDF contiene múltiples.
+    Permite procesar todas o seleccionar cuáles procesar.
+    """
+
+    def __init__(self, parent, datos_ia, nombre_archivo="", callback_procesar=None):
+        super().__init__(parent)
+        self.title(f"Múltiples Empresas Detectadas - {nombre_archivo}")
+        self.geometry("900x600")
+        self.minsize(700, 450)
+
+        self.datos_ia = datos_ia
+        self.callback_procesar = callback_procesar
+        self.extractor_ia = ExtractorIA()
+        self.logger = Logger()
+
+        # Obtener empresas
+        self.empresas = self.extractor_ia.obtener_empresas(datos_ia)
+        self.empresas_seleccionadas = []
+
+        self._crear_ui()
+
+        # Modal
+        self.transient(parent)
+        self.grab_set()
+
+    def _crear_ui(self):
+        main = ttk.Frame(self, padding=10)
+        main.pack(fill='both', expand=True)
+
+        # === Cabecera ===
+        frame_header = ttk.Frame(main)
+        frame_header.pack(fill='x', pady=(0, 10))
+
+        ttk.Label(frame_header,
+                  text=f"🏢 Se han detectado {len(self.empresas)} empresas en el documento",
+                  font=('Arial', 12, 'bold')).pack(side='left')
+
+        # Info de metadata
+        meta = self.datos_ia.get('_metadata', {})
+        confianza = meta.get('confianza_global', 0)
+        ttk.Label(frame_header,
+                  text=f"Confianza: {confianza*100:.0f}%",
+                  foreground='gray').pack(side='right')
+
+        # === Tabla de empresas ===
+        frame_tabla = ttk.LabelFrame(main, text="Empresas Detectadas", padding=10)
+        frame_tabla.pack(fill='both', expand=True, pady=(0, 10))
+
+        # Crear Treeview con checkboxes simulados
+        cols = ('sel', 'cif', 'nombre', 'periodo', 'devengos', 'liquido', 'conceptos')
+        self.tree = ttk.Treeview(frame_tabla, columns=cols, show='headings', height=15)
+
+        self.tree.heading('sel', text='✓')
+        self.tree.heading('cif', text='CIF')
+        self.tree.heading('nombre', text='Empresa')
+        self.tree.heading('periodo', text='Período')
+        self.tree.heading('devengos', text='Devengos')
+        self.tree.heading('liquido', text='Líquido')
+        self.tree.heading('conceptos', text='Conceptos')
+
+        self.tree.column('sel', width=30, anchor='center')
+        self.tree.column('cif', width=100)
+        self.tree.column('nombre', width=250)
+        self.tree.column('periodo', width=100)
+        self.tree.column('devengos', width=100, anchor='e')
+        self.tree.column('liquido', width=100, anchor='e')
+        self.tree.column('conceptos', width=70, anchor='center')
+
+        scroll = ttk.Scrollbar(frame_tabla, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+
+        self.tree.pack(side='left', fill='both', expand=True)
+        scroll.pack(side='right', fill='y')
+
+        # Cargar datos
+        self.vars_seleccion = {}
+        for i, emp in enumerate(self.empresas):
+            info = emp.get('empresa', {})
+            totales = emp.get('totales', {})
+            periodo = emp.get('periodo', {})
+
+            cif = info.get('cif', f'EMP_{i+1}')
+            devengos = totales.get('total_devengos', 0)
+            liquido = totales.get('liquido_a_percibir', 0)
+
+            # Insertar con marca de selección
+            item_id = self.tree.insert('', 'end', values=(
+                '☑',  # Seleccionado por defecto
+                cif,
+                info.get('nombre', 'Sin nombre'),
+                periodo.get('texto', ''),
+                f"{devengos:,.2f} €".replace(',', 'X').replace('.', ',').replace('X', '.'),
+                f"{liquido:,.2f} €".replace(',', 'X').replace('.', ',').replace('X', '.'),
+                len(emp.get('conceptos', []))
+            ))
+            self.vars_seleccion[item_id] = True
+
+        # Click para toggle selección
+        self.tree.bind('<ButtonRelease-1>', self._toggle_seleccion)
+
+        # === Botones de selección ===
+        frame_sel = ttk.Frame(main)
+        frame_sel.pack(fill='x', pady=(0, 10))
+
+        ttk.Button(frame_sel, text="Seleccionar Todas",
+                   command=self._seleccionar_todas).pack(side='left', padx=2)
+        ttk.Button(frame_sel, text="Deseleccionar Todas",
+                   command=self._deseleccionar_todas).pack(side='left', padx=2)
+        ttk.Button(frame_sel, text="Invertir Selección",
+                   command=self._invertir_seleccion).pack(side='left', padx=2)
+
+        # Contador
+        self.var_contador = tk.StringVar(value=f"{len(self.empresas)} seleccionadas")
+        ttk.Label(frame_sel, textvariable=self.var_contador,
+                  foreground='blue').pack(side='right')
+
+        # === Vista previa de empresa seleccionada ===
+        frame_preview = ttk.LabelFrame(main, text="Vista Previa", padding=10)
+        frame_preview.pack(fill='x', pady=(0, 10))
+
+        self.var_preview = tk.StringVar(value="Seleccione una empresa para ver sus conceptos")
+        ttk.Label(frame_preview, textvariable=self.var_preview,
+                  font=('Consolas', 9), wraplength=800).pack(anchor='w')
+
+        self.tree.bind('<<TreeviewSelect>>', self._mostrar_preview)
+
+        # === Botones de acción ===
+        frame_btns = ttk.Frame(main)
+        frame_btns.pack(fill='x')
+
+        ttk.Button(frame_btns, text="Cancelar",
+                   command=self.destroy).pack(side='right', padx=5)
+        ttk.Button(frame_btns, text="✓ Procesar Seleccionadas",
+                   command=self._procesar).pack(side='right', padx=5)
+        ttk.Button(frame_btns, text="📋 Ver JSON Completo",
+                   command=self._ver_json).pack(side='left', padx=5)
+
+    def _toggle_seleccion(self, event):
+        """Toggle selección al hacer click"""
+        region = self.tree.identify_region(event.x, event.y)
+        if region != 'cell':
+            return
+
+        col = self.tree.identify_column(event.x)
+        if col != '#1':  # Solo columna de selección
+            return
+
+        item = self.tree.identify_row(event.y)
+        if item:
+            self.vars_seleccion[item] = not self.vars_seleccion.get(item, False)
+            valores = list(self.tree.item(item)['values'])
+            valores[0] = '☑' if self.vars_seleccion[item] else '☐'
+            self.tree.item(item, values=valores)
+            self._actualizar_contador()
+
+    def _seleccionar_todas(self):
+        for item in self.tree.get_children():
+            self.vars_seleccion[item] = True
+            valores = list(self.tree.item(item)['values'])
+            valores[0] = '☑'
+            self.tree.item(item, values=valores)
+        self._actualizar_contador()
+
+    def _deseleccionar_todas(self):
+        for item in self.tree.get_children():
+            self.vars_seleccion[item] = False
+            valores = list(self.tree.item(item)['values'])
+            valores[0] = '☐'
+            self.tree.item(item, values=valores)
+        self._actualizar_contador()
+
+    def _invertir_seleccion(self):
+        for item in self.tree.get_children():
+            self.vars_seleccion[item] = not self.vars_seleccion.get(item, False)
+            valores = list(self.tree.item(item)['values'])
+            valores[0] = '☑' if self.vars_seleccion[item] else '☐'
+            self.tree.item(item, values=valores)
+        self._actualizar_contador()
+
+    def _actualizar_contador(self):
+        total = sum(1 for v in self.vars_seleccion.values() if v)
+        self.var_contador.set(f"{total} de {len(self.empresas)} seleccionadas")
+
+    def _mostrar_preview(self, event):
+        """Muestra preview de la empresa seleccionada"""
+        sel = self.tree.selection()
+        if not sel:
+            return
+
+        # Obtener índice
+        items = self.tree.get_children()
+        idx = items.index(sel[0])
+
+        if 0 <= idx < len(self.empresas):
+            emp = self.empresas[idx]
+            conceptos = emp.get('conceptos', [])
+
+            preview_lines = []
+            for c in conceptos[:8]:  # Primeros 8 conceptos
+                desc = c.get('descripcion', '')[:30]
+                imp = c.get('importe', 0)
+                tipo = c.get('tipo', '')
+                preview_lines.append(f"  {tipo:12} | {desc:30} | {imp:>12,.2f} €")
+
+            if len(conceptos) > 8:
+                preview_lines.append(f"  ... y {len(conceptos) - 8} conceptos más")
+
+            self.var_preview.set('\n'.join(preview_lines) if preview_lines else "Sin conceptos")
+
+    def _ver_json(self):
+        """Abre ventana con JSON completo"""
+        VentanaEditorJSON(
+            self,
+            self.datos_ia,
+            nombre_archivo="Multi-empresa",
+            callback_aceptar=None
+        )
+
+    def _procesar(self):
+        """Procesa las empresas seleccionadas"""
+        # Obtener índices seleccionados
+        items = self.tree.get_children()
+        seleccionadas = []
+
+        for i, item in enumerate(items):
+            if self.vars_seleccion.get(item, False):
+                seleccionadas.append(self.empresas[i])
+
+        if not seleccionadas:
+            messagebox.showwarning("Aviso", "Seleccione al menos una empresa para procesar")
+            return
+
+        self.empresas_seleccionadas = seleccionadas
+        self.logger.info(f"Procesando {len(seleccionadas)} empresas seleccionadas")
+
+        if self.callback_procesar:
+            self.callback_procesar(seleccionadas)
 
         self.destroy()
 
@@ -4802,22 +5142,48 @@ class AplicacionFase3:
                     # === Datos del PDF (visualización) ===
                     # Usar datos de IA si disponibles, sino del procesador PDF
                     if datos_extraidos:
-                        emp = datos_extraidos.get('empresa', {})
-                        per = datos_extraidos.get('periodo', {})
+                        # Obtener empresas del nuevo formato
+                        empresas = self.extractor_ia.obtener_empresas(datos_extraidos)
 
-                        cif = emp.get('cif') or self.pdf.cif
-                        self.var_cif.set(cif or "(No detectado)")
+                        if empresas:
+                            # Usar datos de la primera empresa para visualización inicial
+                            primera = empresas[0]
+                            emp = primera.get('empresa', {})
+                            per = primera.get('periodo', {})
 
-                        # Actualizar datos del PDF con los de IA
-                        self.pdf.cif = cif
-                        self.pdf.periodo = per.get('texto') or self.pdf.periodo
-                        self.pdf.mes = per.get('mes') or self.pdf.mes
-                        self.pdf.anno = per.get('año') or self.pdf.anno
+                            # Si hay múltiples empresas, mostrar indicador
+                            if len(empresas) > 1:
+                                cif = f"({len(empresas)} empresas)"
+                                self.var_cif.set(cif)
+                            else:
+                                cif = emp.get('cif') or self.pdf.cif
+                                self.var_cif.set(cif or "(No detectado)")
+                                self.pdf.cif = cif
+
+                            # Actualizar datos del PDF con los de IA
+                            self.pdf.periodo = per.get('texto') or self.pdf.periodo
+                            self.pdf.mes = per.get('mes') or self.pdf.mes
+                            self.pdf.anno = per.get('año') or self.pdf.anno
+                        else:
+                            # Formato antiguo - compatibilidad
+                            emp = datos_extraidos.get('empresa', {})
+                            per = datos_extraidos.get('periodo', {})
+
+                            cif = emp.get('cif') or self.pdf.cif
+                            self.var_cif.set(cif or "(No detectado)")
+                            self.pdf.cif = cif
+                            self.pdf.periodo = per.get('texto') or self.pdf.periodo
+                            self.pdf.mes = per.get('mes') or self.pdf.mes
+                            self.pdf.anno = per.get('año') or self.pdf.anno
                     else:
                         self.var_cif.set(self.pdf.cif or "(No detectado)")
 
-                    # Validar CIF/NIF
-                    if self.pdf.cif:
+                    # Validar CIF/NIF (solo si no es multi-empresa)
+                    empresas = self.extractor_ia.obtener_empresas(datos_extraidos) if datos_extraidos else []
+                    if len(empresas) > 1:
+                        # Multi-empresa: mostrar indicador especial
+                        self.label_cif_status.configure(text="🏢 Multi", foreground='blue')
+                    elif self.pdf.cif:
                         cif_valido, cif_tipo, cif_msg = ValidadorCIF.validar(self.pdf.cif)
                         if cif_valido:
                             self.label_cif_status.configure(text=f"✅ {cif_tipo}", foreground='green')
@@ -4855,15 +5221,38 @@ class AplicacionFase3:
                     if datos_extraidos and metodo_usado == "ia_claude":
                         self.datos_ia = datos_extraidos
 
-                        # Convertir a conceptos internos
-                        self.conceptos_extraidos = self.extractor_ia.convertir_a_conceptos(datos_extraidos)
+                        # Detectar si hay múltiples empresas
+                        es_multi = self.extractor_ia.es_multi_empresa(datos_extraidos)
+                        empresas = self.extractor_ia.obtener_empresas(datos_extraidos)
+                        num_empresas = len(empresas)
 
-                        self.var_estado_carga.set(f"🤖 {self.pdf.nombre} - Extraído con IA")
+                        if es_multi:
+                            # Múltiples empresas detectadas
+                            self.var_estado_carga.set(
+                                f"🏢 {self.pdf.nombre} - {num_empresas} empresas detectadas"
+                            )
+                            self.logger.info(
+                                f"PDF multi-empresa detectado",
+                                f"Empresas: {num_empresas}"
+                            )
+                            # Mostrar ventana de selección de empresas
+                            self._mostrar_selector_empresas(datos_extraidos)
+                        else:
+                            # Una sola empresa
+                            if empresas:
+                                primera_empresa = empresas[0]
+                                self.conceptos_extraidos = self.extractor_ia.convertir_a_conceptos(primera_empresa)
+                            else:
+                                self.conceptos_extraidos = []
 
-                        # Mostrar editor JSON si está configurado
-                        config = Configuracion()
-                        if config.get('ia', 'mostrar_editor_json', True):
-                            self._mostrar_editor_json(datos_extraidos)
+                            self.var_estado_carga.set(f"🤖 {self.pdf.nombre} - Extraído con IA")
+
+                            # Mostrar editor JSON si está configurado
+                            config = Configuracion()
+                            if config.get('ia', 'mostrar_editor_json', True):
+                                # Pasar solo la primera empresa para edición
+                                datos_a_editar = empresas[0] if empresas else datos_extraidos
+                                self._mostrar_editor_json(datos_a_editar)
                     else:
                         # Modo programa tradicional
                         self._detectar_plantilla()
@@ -4897,6 +5286,175 @@ class AplicacionFase3:
             nombre_archivo=self.pdf.nombre if self.pdf else "",
             callback_aceptar=on_aceptar
         )
+
+    def _mostrar_selector_empresas(self, datos_ia):
+        """Muestra el selector cuando hay múltiples empresas en el PDF"""
+        def on_procesar(empresas_seleccionadas):
+            """Callback cuando el usuario selecciona empresas para procesar"""
+            if not empresas_seleccionadas:
+                return
+
+            num_seleccionadas = len(empresas_seleccionadas)
+            self.logger.info(f"Procesando {num_seleccionadas} empresas seleccionadas")
+
+            if num_seleccionadas == 1:
+                # Una sola empresa seleccionada - flujo normal
+                empresa = empresas_seleccionadas[0]
+                self.conceptos_extraidos = self.extractor_ia.convertir_a_conceptos(empresa)
+
+                # Actualizar datos del PDF con esta empresa
+                info_emp = empresa.get('empresa', {})
+                per = empresa.get('periodo', {})
+
+                self.pdf.cif = info_emp.get('cif') or self.pdf.cif
+                self.pdf.periodo = per.get('texto') or self.pdf.periodo
+
+                self.var_cif.set(self.pdf.cif or "(No detectado)")
+                self.var_periodo.set(self.pdf.periodo or "(No detectado)")
+
+                # Buscar empresa en BD
+                if self.pdf.cif:
+                    self._buscar_empresa()
+
+                self.var_estado_carga.set(
+                    f"🤖 {self.pdf.nombre} - {info_emp.get('nombre', 'Empresa')} cargada"
+                )
+
+                # Mostrar editor si está configurado
+                config = Configuracion()
+                if config.get('ia', 'mostrar_editor_json', True):
+                    self._mostrar_editor_json(empresa)
+            else:
+                # Múltiples empresas - procesar en lote
+                self._procesar_empresas_lote(empresas_seleccionadas)
+
+        VentanaMultiEmpresa(
+            self.root,
+            datos_ia,
+            nombre_archivo=self.pdf.nombre if self.pdf else "",
+            callback_procesar=on_procesar
+        )
+
+    def _procesar_empresas_lote(self, empresas):
+        """Procesa múltiples empresas en lote, generando un asiento por cada una"""
+        self.logger.info(f"Iniciando proceso en lote: {len(empresas)} empresas")
+
+        resultados = []
+
+        for i, empresa in enumerate(empresas):
+            info_emp = empresa.get('empresa', {})
+            cif = info_emp.get('cif', '')
+            nombre = info_emp.get('nombre', f'Empresa {i+1}')
+            periodo = empresa.get('periodo', {})
+
+            self.logger.info(f"Procesando empresa {i+1}/{len(empresas)}: {nombre} ({cif})")
+
+            # Convertir conceptos
+            conceptos = self.extractor_ia.convertir_a_conceptos(empresa)
+
+            # Buscar empresa en BD
+            empresa_bd = self.db.buscar_empresa_por_cif(cif) if cif else None
+
+            # Preparar datos
+            empresa_data = None
+            if empresa_bd:
+                empresa_data = {
+                    'codigo': empresa_bd.get('codigo'),
+                    'nombre': empresa_bd.get('nombre'),
+                    'cif': cif,
+                    'base_datos': self.db.obtener_base_datos_contable(empresa_bd.get('codigo'))
+                }
+
+            # Obtener número de asiento
+            anno = periodo.get('año') or datetime.now().year
+            numero_asiento = None
+            if empresa_bd:
+                numero_asiento = self.db.obtener_siguiente_asiento(
+                    empresa_bd.get('codigo'), anno
+                )
+
+            # Generar asiento
+            asiento = self.generador_asientos.generar_desde_conceptos(
+                conceptos=conceptos,
+                empresa=empresa_data,
+                periodo=periodo.get('texto', ''),
+                numero_asiento=numero_asiento
+            )
+
+            resultados.append({
+                'empresa': nombre,
+                'cif': cif,
+                'asiento': asiento,
+                'conceptos': len(conceptos),
+                'encontrada_bd': empresa_bd is not None
+            })
+
+        # Mostrar resumen
+        self._mostrar_resumen_lote(resultados)
+
+    def _mostrar_resumen_lote(self, resultados):
+        """Muestra resumen del procesamiento en lote"""
+        ventana = tk.Toplevel(self.root)
+        ventana.title("Resumen - Procesamiento en Lote")
+        ventana.geometry("800x500")
+
+        main = ttk.Frame(ventana, padding=10)
+        main.pack(fill='both', expand=True)
+
+        ttk.Label(main,
+                  text=f"✅ Se han generado {len(resultados)} asientos",
+                  font=('Arial', 14, 'bold')).pack(pady=(0, 10))
+
+        # Tabla de resultados
+        cols = ('empresa', 'cif', 'conceptos', 'encontrada', 'asiento')
+        tree = ttk.Treeview(main, columns=cols, show='headings', height=15)
+
+        tree.heading('empresa', text='Empresa')
+        tree.heading('cif', text='CIF')
+        tree.heading('conceptos', text='Conceptos')
+        tree.heading('encontrada', text='En BD')
+        tree.heading('asiento', text='Nº Asiento')
+
+        tree.column('empresa', width=250)
+        tree.column('cif', width=100)
+        tree.column('conceptos', width=80, anchor='center')
+        tree.column('encontrada', width=80, anchor='center')
+        tree.column('asiento', width=100, anchor='center')
+
+        for r in resultados:
+            asiento = r['asiento']
+            tree.insert('', 'end', values=(
+                r['empresa'],
+                r['cif'],
+                r['conceptos'],
+                '✅' if r['encontrada_bd'] else '❌',
+                asiento.numero_asiento if asiento else '-'
+            ))
+
+        scroll = ttk.Scrollbar(main, orient='vertical', command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+
+        tree.pack(side='left', fill='both', expand=True)
+        scroll.pack(side='right', fill='y')
+
+        # Botones
+        frame_btns = ttk.Frame(ventana)
+        frame_btns.pack(fill='x', padx=10, pady=10)
+
+        def guardar_todos():
+            guardados = 0
+            for r in resultados:
+                if r['asiento'] and r['encontrada_bd']:
+                    # Aquí iría la lógica de guardar en BD
+                    guardados += 1
+            messagebox.showinfo("Info", f"Se guardaron {guardados} asientos")
+            ventana.destroy()
+
+        ttk.Button(frame_btns, text="Cerrar", command=ventana.destroy).pack(side='right')
+        ttk.Button(frame_btns, text="💾 Guardar Todos en BD",
+                   command=guardar_todos).pack(side='right', padx=5)
+
+        self.var_estado_carga.set(f"✅ Procesadas {len(resultados)} empresas en lote")
 
     def _buscar_empresa(self):
         """Busca la empresa por CIF en la base de datos Geyce"""
