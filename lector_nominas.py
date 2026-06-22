@@ -1,92 +1,308 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-LECTOR DE NÓMINAS - FASE 8: Integración con IA (Claude)
-Versión: 8.0.0
-Fecha: 2026-06-22
-Autor: Claude para Jurado Asesores Tributarios - 2026
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                                                                              ║
+║                    LECTOR DE NÓMINAS - SISTEMA INTELIGENTE                   ║
+║                                                                              ║
+║                           Versión 8.0.0 (Fase 8)                             ║
+║                              Fecha: 2026-06-22                               ║
+║                                                                              ║
+║            Desarrollado para: Jurado Asesores Tributarios                    ║
+║            Desarrollado por: Claude (Anthropic)                              ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
 
-FUNCIONALIDADES FASE 1:
-- Instalación automática de dependencias
-- Arrastrar y soltar PDFs (Drag & Drop)
-- OCR automático si no hay texto nativo
-- Detección automática de CIF y período
-- Interfaz intuitiva con mínima interacción
-- Ventana maximizada a pantalla completa
+════════════════════════════════════════════════════════════════════════════════
+                              ¿QUÉ HACE ESTE PROGRAMA?
+════════════════════════════════════════════════════════════════════════════════
 
-FUNCIONALIDADES FASE 2:
-- Sistema de logging detallado con ventana de consulta
-- Contador de errores en tiempo real en cabecera
-- Búsqueda de empresa por CIF en base de datos Geyce
-- Consulta de plan de cuentas por empresa
-- Obtención de número de asiento
+Este programa automatiza la lectura de PDFs de nóminas y resúmenes de nóminas,
+extrae la información relevante (empresa, período, conceptos, importes) y
+genera asientos contables listos para insertar en la base de datos Geyce.
 
-FUNCIONALIDADES FASE 3:
-- Sistema de plantillas con aprendizaje automático
-- Auto-detección del tipo de documento (fingerprint)
-- Modo aprendizaje guiado para nuevos formatos
-- Extracción inteligente de conceptos e importes
-- Mapeo automático a cuentas contables
-- Mejora continua con cada corrección del usuario
+FLUJO PRINCIPAL:
+────────────────
 
-FUNCIONALIDADES FASE 3.5:
-- Integración con OpenDataLoader PDF (precisión 0.907)
-- Extracción avanzada de tablas con bounding boxes
-- OCR mejorado con 80+ idiomas
-- Detección de estructura basada en coordenadas
-- Fallback a PyMuPDF si OpenDataLoader no disponible
+    ┌─────────────┐      ┌─────────────┐      ┌─────────────┐      ┌─────────────┐
+    │   PDF de    │      │   IA Lee    │      │   Usuario   │      │   Asiento   │
+    │   Nóminas   │ ───▶ │   y Extrae  │ ───▶ │   Valida    │ ───▶ │   Contable  │
+    │             │      │   JSON      │      │   y Corrige │      │   en BD     │
+    └─────────────┘      └─────────────┘      └─────────────┘      └─────────────┘
 
-FUNCIONALIDADES FASE 4:
-- Proceso masivo de múltiples PDFs
-- Cola de procesamiento con progreso visual
-- Tabla de resultados con estado por documento
-- Exportación a Excel/CSV
-- Generación masiva de asientos contables
-- Resumen estadístico del proceso
+    1. Arrastra un PDF (o varios) a la ventana
+    2. La IA (Claude) lee el documento con visión artificial
+    3. Extrae automáticamente: CIF, empresa, período, conceptos, importes
+    4. Convierte todo a JSON estructurado
+    5. El usuario revisa/corrige si es necesario
+    6. Se genera el asiento contable con las cuentas configuradas
+    7. Se guarda en la base de datos Geyce
 
-FUNCIONALIDADES FASE 5:
-- Validación de CIF/NIF español con dígito de control
-- Verificación de cuadre contable (debe = haber)
-- Detección de documentos duplicados (hash + fingerprint)
-- Validación de rangos de importes (alertas por anomalías)
-- Panel de alertas y advertencias en tiempo real
-- Informe de validación exportable
+CARACTERÍSTICAS PRINCIPALES:
+────────────────────────────
 
-FUNCIONALIDADES FASE 6:
-- Generación automática de asientos contables
-- Estructura completa: cabecera + líneas de apunte
-- Ventana de previsualización y edición de asientos
-- Inserción directa en base de datos Geyce
-- Cuadre automático del asiento
-- Soporte para múltiples líneas por concepto
-- Exportación de asiento a formato texto
+    ✓ Extracción con IA (Claude)     - Lee PDFs directamente con visión artificial
+    ✓ Multi-empresa                  - Detecta múltiples empresas en un solo PDF
+    ✓ Validación automática          - CIF/NIF, cuadre contable, duplicados
+    ✓ Configuración por empresa      - Cada empresa tiene sus propias subcuentas
+    ✓ Proceso masivo                 - Procesa múltiples PDFs a la vez
+    ✓ Histórico                      - Guarda registro de todos los asientos
+    ✓ Dashboard                      - Estadísticas de procesamiento
+    ✓ Aprendizaje                    - Mejora con las correcciones del usuario
 
-FUNCIONALIDADES FASE 7:
-- Sistema de informes y estadísticas
-- Dashboard con métricas de procesamiento
-- Histórico de asientos generados con búsqueda
-- Configuración personalizable persistente (JSON)
-- Personalización de cuentas contables por defecto
-- Configuración de conexión a base de datos
-- Exportación de informes a PDF/Excel
+════════════════════════════════════════════════════════════════════════════════
+                              ARQUITECTURA DEL SISTEMA
+════════════════════════════════════════════════════════════════════════════════
 
-FUNCIONALIDADES FASE 7.5:
-- Configuración de cuentas contables POR EMPRESA
-- Detección automática de empresa sin configurar
-- Ventana de configuración de subcuentas por empresa
-- Persistencia de configuración por CIF
-- Uso de cuentas específicas al generar asientos
-- Las cuentas globales son solo valores por defecto
+CAPAS:
+──────
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │                         INTERFAZ DE USUARIO (GUI)                       │
+    │   AplicacionFase3, VentanaAsiento, VentanaConfiguracion, etc.           │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │                         LÓGICA DE NEGOCIO                               │
+    │   GeneradorAsientos, GestorValidaciones, ExtractorIA, ExtractorConceptos│
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │                         ACCESO A DATOS                                  │
+    │   DatabaseManager, Configuracion, HistoricoAsientos, GestorPlantillas   │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │                         SERVICIOS EXTERNOS                              │
+    │   Claude API (Anthropic), SQL Server (Geyce), Sistema de archivos       │
+    └─────────────────────────────────────────────────────────────────────────┘
 
-FUNCIONALIDADES FASE 8 (NUEVA - IA):
-- Extracción de datos mediante IA (Claude API)
-- La IA lee el PDF directamente (visión)
-- Conversión automática a JSON estructurado
-- Ventana de edición/validación del JSON extraído
-- Sistema de aprendizaje con correcciones del usuario
-- Historial de extracciones por empresa
-- Distinción visual entre datos IA vs programa
-- Configuración de API key segura
+CLASES PRINCIPALES:
+───────────────────
+
+    EXTRACCIÓN DE DATOS:
+    │
+    ├── ExtractorIA              → Envía PDF a Claude, recibe JSON estructurado
+    │                              Detecta una o múltiples empresas automáticamente
+    │
+    ├── PDFProcessor             → Procesa PDF para visualización (PyMuPDF/OCR)
+    │                              Extrae texto, detecta CIF y período
+    │
+    ├── ExtractorConceptos       → Extrae conceptos usando regex/patrones
+    │                              Fallback cuando no hay IA disponible
+    │
+    └── DetectorDocumento        → Identifica tipo de documento por fingerprint
+                                   Asocia plantillas aprendidas
+
+    VALIDACIÓN:
+    │
+    ├── ValidadorCIF             → Valida CIF/NIF/NIE español con dígito control
+    │
+    ├── ValidadorContable        → Verifica cuadre contable (debe = haber)
+    │
+    ├── ValidadorImportes        → Detecta anomalías en importes (muy alto/bajo)
+    │
+    ├── DetectorDuplicados       → Detecta documentos ya procesados (hash)
+    │
+    └── GestorValidaciones       → Orquesta todas las validaciones
+
+    GENERACIÓN DE ASIENTOS:
+    │
+    ├── GeneradorAsientos        → Crea asientos desde conceptos extraídos
+    │                              Usa cuentas configuradas por empresa
+    │
+    ├── AsientoContable          → Estructura de un asiento (cabecera + líneas)
+    │
+    └── LineaApunte              → Una línea del asiento (cuenta, debe, haber)
+
+    PERSISTENCIA:
+    │
+    ├── DatabaseManager          → Conexión a SQL Server (Geyce/EASP)
+    │                              Búsqueda de empresas, plan de cuentas
+    │
+    ├── Configuracion            → Configuración global persistente (JSON)
+    │                              API key, cuentas por defecto, opciones
+    │
+    ├── ConfiguracionEmpresa     → Cuentas contables por empresa (JSON por CIF)
+    │
+    ├── HistoricoAsientos        → Registro de asientos generados
+    │
+    └── GestorPlantillas         → Almacena plantillas de extracción aprendidas
+
+    INTERFAZ GRÁFICA:
+    │
+    ├── AplicacionFase3          → Ventana principal, orquesta todo el flujo
+    │
+    ├── VentanaEditorJSON        → Editor visual del JSON extraído por IA
+    │
+    ├── VentanaMultiEmpresa      → Selector cuando hay múltiples empresas
+    │
+    ├── VentanaAsiento           → Previsualización y edición de asientos
+    │
+    ├── VentanaConfiguracion     → Configuración de BD, cuentas, IA
+    │
+    ├── VentanaCuentasEmpresa    → Configuración de subcuentas por empresa
+    │
+    ├── VentanaProcesoMasivo     → Procesar múltiples PDFs a la vez
+    │
+    ├── VentanaDashboard         → Estadísticas y métricas
+    │
+    ├── VentanaHistorico         → Consulta de asientos anteriores
+    │
+    └── VentanaAlertas           → Muestra errores y advertencias
+
+════════════════════════════════════════════════════════════════════════════════
+                              FLUJO DETALLADO CON IA
+════════════════════════════════════════════════════════════════════════════════
+
+1. ENTRADA DEL PDF:
+   ─────────────────
+   - El usuario arrastra un PDF a la zona de drop
+   - El sistema verifica si la IA está disponible (API key configurada)
+
+2. EXTRACCIÓN CON IA:
+   ───────────────────
+   - El PDF se envía a Claude (base64) con un prompt especializado
+   - Claude analiza visualmente el documento completo
+   - Devuelve JSON estructurado con TODAS las empresas detectadas:
+
+     {
+       "empresas": [
+         {
+           "empresa": {"cif": "B12345678", "nombre": "ACME S.L."},
+           "periodo": {"mes": 6, "año": 2024, "texto": "Junio 2024"},
+           "conceptos": [
+             {"codigo": "001", "descripcion": "Sueldos", "tipo": "devengo", "importe": 45000.00},
+             {"codigo": "500", "descripcion": "SS Empresa", "tipo": "ss_empresa", "importe": 12000.00},
+             ...
+           ],
+           "totales": {"total_devengos": 53000.00, "liquido_a_percibir": 38000.00}
+         },
+         { ... otra empresa ... }
+       ],
+       "_metadata": {"total_empresas": 2, "confianza_global": 0.95}
+     }
+
+3. DETECCIÓN MULTI-EMPRESA:
+   ─────────────────────────
+   - Si hay 1 empresa → flujo normal (editor JSON)
+   - Si hay N empresas → ventana de selección (VentanaMultiEmpresa)
+     - El usuario elige cuáles procesar
+     - Se genera un asiento por cada empresa seleccionada
+
+4. EDICIÓN Y VALIDACIÓN:
+   ──────────────────────
+   - VentanaEditorJSON muestra los datos extraídos
+   - El usuario puede corregir errores
+   - Se valida CIF, importes, cuadre contable
+
+5. GENERACIÓN DEL ASIENTO:
+   ────────────────────────
+   - GeneradorAsientos crea el asiento usando:
+     - Conceptos extraídos (de IA o programa)
+     - Cuentas configuradas para la empresa (o globales por defecto)
+     - Número de asiento de la BD
+
+   - Estructura del asiento:
+
+     Cabecera: Fecha, Nº Asiento, Empresa, Período
+     ─────────────────────────────────────────────
+     Líneas:
+       6400000 Sueldos y salarios      45,000.00 €     (DEBE)
+       6420000 SS a cargo empresa      12,000.00 €     (DEBE)
+       4751000 H.P. IRPF retenciones                7,500.00 €  (HABER)
+       4760000 SS a cargo trabajador                3,200.00 €  (HABER)
+       4650000 Remuner. ptes. pago                 38,000.00 €  (HABER)
+       ─────────────────────────────────────────────
+       TOTAL:                          57,000.00 €    57,000.00 €
+
+6. GUARDADO EN BASE DE DATOS:
+   ──────────────────────────
+   - El asiento se inserta en la BD contable de la empresa
+   - Se registra en el histórico local
+
+════════════════════════════════════════════════════════════════════════════════
+                              CONFIGURACIÓN
+════════════════════════════════════════════════════════════════════════════════
+
+ARCHIVOS DE CONFIGURACIÓN (en ~/.lector_nominas/):
+──────────────────────────────────────────────────
+
+    ~/.lector_nominas/
+    ├── config.json                 → Configuración global
+    │                                  - Conexión BD (server, user, password)
+    │                                  - Cuentas contables por defecto
+    │                                  - API key de Anthropic
+    │                                  - Opciones de interfaz
+    │
+    ├── empresas/                   → Configuración por empresa
+    │   ├── B12345678.json          → Cuentas para empresa con CIF B12345678
+    │   ├── A98765432.json          → Cuentas para empresa con CIF A98765432
+    │   └── ...
+    │
+    ├── plantillas/                 → Plantillas de extracción aprendidas
+    │   ├── indice.json
+    │   └── PLT_*.json
+    │
+    ├── historico.json              → Histórico de asientos generados
+    │
+    └── extracciones_ia/            → JSON extraídos por IA (para aprendizaje)
+        ├── nominas_202406_123456.json
+        └── ...
+
+BASE DE DATOS:
+──────────────
+    - Servidor: SQL Server (configurable)
+    - BD Geyce: GEYCE_Avansa (empresas, plan de cuentas)
+    - BD EASP: easp (asientos contables)
+
+════════════════════════════════════════════════════════════════════════════════
+                              DEPENDENCIAS
+════════════════════════════════════════════════════════════════════════════════
+
+    OBLIGATORIAS (se instalan automáticamente):
+    ────────────────────────────────────────────
+    - PyMuPDF (fitz)      → Lectura de PDFs, extracción de texto
+    - pytesseract         → OCR para PDFs sin texto nativo
+    - Pillow (PIL)        → Procesamiento de imágenes
+    - pyodbc              → Conexión a SQL Server
+    - anthropic           → API de Claude (IA)
+
+    OPCIONALES:
+    ───────────
+    - opendataloader-pdf  → Extracción avanzada de tablas (precisión 0.907)
+    - openpyxl            → Exportación a Excel
+
+    SISTEMA:
+    ────────
+    - Tesseract OCR       → Motor OCR (debe instalarse aparte en Windows)
+    - ODBC Driver 17      → Driver de SQL Server
+
+════════════════════════════════════════════════════════════════════════════════
+                              HISTORIAL DE VERSIONES
+════════════════════════════════════════════════════════════════════════════════
+
+    v1.0.0  - Lectura básica de PDFs, drag & drop, OCR
+    v2.0.0  - Integración con BD Geyce, búsqueda de empresas
+    v3.0.0  - Sistema de plantillas con aprendizaje
+    v3.5.0  - Integración con OpenDataLoader PDF
+    v4.0.0  - Proceso masivo de múltiples PDFs
+    v5.0.0  - Validaciones (CIF, cuadre, duplicados)
+    v6.0.0  - Generación de asientos contables
+    v7.0.0  - Dashboard, histórico, configuración persistente
+    v7.5.0  - Configuración de cuentas por empresa
+    v8.0.0  - Integración con IA (Claude API), multi-empresa   ← ACTUAL
+
+════════════════════════════════════════════════════════════════════════════════
+                              USO BÁSICO
+════════════════════════════════════════════════════════════════════════════════
+
+    1. Ejecutar: python3 lector_nominas.py
+
+    2. Primera vez:
+       - Ir a ⚙️ Config → Base de Datos: configurar conexión
+       - Ir a ⚙️ Config → 🤖 IA: introducir API key de Anthropic
+
+    3. Uso normal:
+       - Arrastrar PDF a la ventana
+       - Revisar datos extraídos
+       - Generar asiento (botón 📝 Asiento)
+       - Guardar en BD
+
+════════════════════════════════════════════════════════════════════════════════
 """
 
 VERSION = "8.0.0"
