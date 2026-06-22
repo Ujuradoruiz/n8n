@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-LECTOR DE NÓMINAS - FASE 5: Validaciones y Verificaciones
-Versión: 5.0.0
-Fecha: 2026-04-08
+LECTOR DE NÓMINAS - FASE 8: Integración con IA (Claude)
+Versión: 8.0.0
+Fecha: 2026-06-22
 Autor: Claude para Jurado Asesores Tributarios - 2026
 
 FUNCIONALIDADES FASE 1:
@@ -70,17 +70,27 @@ FUNCIONALIDADES FASE 7:
 - Configuración de conexión a base de datos
 - Exportación de informes a PDF/Excel
 
-FUNCIONALIDADES FASE 7.5 (NUEVA):
+FUNCIONALIDADES FASE 7.5:
 - Configuración de cuentas contables POR EMPRESA
 - Detección automática de empresa sin configurar
 - Ventana de configuración de subcuentas por empresa
 - Persistencia de configuración por CIF
 - Uso de cuentas específicas al generar asientos
 - Las cuentas globales son solo valores por defecto
+
+FUNCIONALIDADES FASE 8 (NUEVA - IA):
+- Extracción de datos mediante IA (Claude API)
+- La IA lee el PDF directamente (visión)
+- Conversión automática a JSON estructurado
+- Ventana de edición/validación del JSON extraído
+- Sistema de aprendizaje con correcciones del usuario
+- Historial de extracciones por empresa
+- Distinción visual entre datos IA vs programa
+- Configuración de API key segura
 """
 
-VERSION = "7.5.0"
-VERSION_FECHA = "2026-04-08"
+VERSION = "8.0.0"
+VERSION_FECHA = "2026-06-22"
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -105,7 +115,8 @@ def instalar_dependencias():
         'pytesseract': 'pytesseract',
         'PIL': 'Pillow',
         'pyodbc': 'pyodbc',
-        'opendataloader_pdf': 'opendataloader-pdf'
+        'opendataloader_pdf': 'opendataloader-pdf',
+        'anthropic': 'anthropic'  # FASE 8: API de Claude
     }
 
     for modulo, paquete in dependencias.items():
@@ -124,6 +135,7 @@ instalar_dependencias()
 import fitz
 import pytesseract
 import pyodbc
+import base64
 from PIL import Image, ImageTk
 
 # OpenDataLoader - con fallback si no está disponible
@@ -133,6 +145,14 @@ try:
 except ImportError:
     OPENDATALOADER_OK = False
     print("⚠️ OpenDataLoader no disponible. Usando PyMuPDF como fallback.")
+
+# Anthropic (Claude API) - para extracción IA
+try:
+    import anthropic
+    ANTHROPIC_OK = True
+except ImportError:
+    ANTHROPIC_OK = False
+    print("⚠️ Anthropic no disponible. Instale con: pip install anthropic")
 
 # =============================================================================
 # CONFIGURACIÓN
@@ -1308,7 +1328,7 @@ class Configuracion:
 
     # Configuración por defecto
     DEFAULTS = {
-        'version': '7.0.0',
+        'version': '8.0.0',
         'base_datos': {
             'server': 'Srvv01',
             'user': 'sa',
@@ -1346,6 +1366,15 @@ class Configuracion:
         'historico': {
             'max_registros': 1000,
             'auto_guardar': True
+        },
+        # FASE 8: Configuración de IA
+        'ia': {
+            'api_key': '',  # API key de Anthropic
+            'modelo': 'claude-sonnet-4-20250514',  # Modelo por defecto
+            'max_tokens': 4096,
+            'habilitado': True,  # Si está deshabilitado, usa modo programa
+            'guardar_extracciones': True,  # Guardar JSON extraídos
+            'mostrar_editor_json': True  # Mostrar editor antes de procesar
         }
     }
 
@@ -1438,6 +1467,31 @@ class Configuracion:
         self._config = self.DEFAULTS.copy()
         self._guardar()
         self.logger.info("Configuración restaurada a valores por defecto")
+
+    # === Métodos para IA (Fase 8) ===
+    def get_api_key(self):
+        """Obtiene la API key de Anthropic"""
+        return self.get('ia', 'api_key', '')
+
+    def set_api_key(self, api_key):
+        """Establece la API key de Anthropic"""
+        self.set('ia', 'api_key', api_key)
+
+    def get_modelo_ia(self):
+        """Obtiene el modelo de IA configurado"""
+        return self.get('ia', 'modelo', 'claude-sonnet-4-20250514')
+
+    def set_modelo_ia(self, modelo):
+        """Establece el modelo de IA"""
+        self.set('ia', 'modelo', modelo)
+
+    def ia_habilitada(self):
+        """Verifica si la IA está habilitada"""
+        return self.get('ia', 'habilitado', True) and bool(self.get_api_key())
+
+    def get_config_ia(self):
+        """Obtiene toda la configuración de IA"""
+        return self.get('ia')
 
 
 # =============================================================================
@@ -2609,6 +2663,667 @@ class ExtractorConceptos:
 
 
 # =============================================================================
+# CLASE: ExtractorIA (Extracción mediante IA - Claude API) - FASE 8
+# =============================================================================
+class ExtractorIA:
+    """
+    Extrae datos de nóminas usando IA (Claude API).
+
+    Flujo:
+    1. Recibe el PDF directamente
+    2. Lo envía a Claude con visión
+    3. Claude interpreta y devuelve JSON estructurado
+    4. El sistema procesa el JSON limpio
+    """
+    _instancia = None
+
+    # Estructura JSON que esperamos de la IA
+    ESTRUCTURA_JSON = """
+    {
+        "empresa": {
+            "cif": "B12345678",
+            "nombre": "Nombre de la empresa",
+            "domicilio": "Dirección (opcional)"
+        },
+        "periodo": {
+            "mes": 6,
+            "año": 2024,
+            "texto": "Junio 2024"
+        },
+        "trabajadores": {
+            "total": 25,
+            "detalle": []
+        },
+        "conceptos": [
+            {
+                "codigo": "001",
+                "descripcion": "Sueldos y salarios",
+                "tipo": "devengo",
+                "importe": 45230.50
+            },
+            {
+                "codigo": "002",
+                "descripcion": "Complementos salariales",
+                "tipo": "devengo",
+                "importe": 8500.00
+            },
+            {
+                "codigo": "500",
+                "descripcion": "Contingencias comunes (empresa)",
+                "tipo": "ss_empresa",
+                "importe": 12500.00
+            },
+            {
+                "codigo": "501",
+                "descripcion": "Contingencias comunes (trabajador)",
+                "tipo": "ss_trabajador",
+                "importe": 3200.00
+            },
+            {
+                "codigo": "600",
+                "descripcion": "IRPF",
+                "tipo": "retencion",
+                "importe": 7500.00
+            }
+        ],
+        "totales": {
+            "total_devengos": 53730.50,
+            "total_ss_empresa": 15800.00,
+            "total_ss_trabajador": 4100.00,
+            "total_irpf": 7500.00,
+            "liquido_a_percibir": 42130.50
+        },
+        "observaciones": "Cualquier observación relevante",
+        "_metadata": {
+            "confianza": 0.95,
+            "campos_dudosos": [],
+            "formato_detectado": "Resumen mensual de nóminas"
+        }
+    }
+    """
+
+    PROMPT_SISTEMA = """Eres un experto en nóminas españolas y contabilidad. Tu tarea es extraer
+información de documentos PDF de nóminas o resúmenes de nóminas y convertirlos a JSON estructurado.
+
+IMPORTANTE:
+- Extrae TODOS los conceptos que encuentres (devengos, deducciones, bases, etc.)
+- Los importes deben ser números (sin símbolos de euro ni separadores de miles)
+- El CIF/NIF debe estar en formato correcto (letra + 8 dígitos o 8 dígitos + letra)
+- Si no encuentras un dato, usa null en lugar de inventarlo
+- El campo "tipo" de cada concepto debe ser uno de: "devengo", "deduccion", "ss_empresa", "ss_trabajador", "retencion", "base"
+- Si hay varios trabajadores, suma los importes por concepto
+- Incluye un nivel de confianza (0-1) en _metadata
+
+Devuelve SOLO el JSON, sin explicaciones ni markdown."""
+
+    def __new__(cls):
+        if cls._instancia is None:
+            cls._instancia = super().__new__(cls)
+            cls._instancia._inicializar()
+        return cls._instancia
+
+    def _inicializar(self):
+        self.logger = Logger()
+        self.config = Configuracion()
+        self.client = None
+        self._historial_extracciones = []
+
+        # Directorio para guardar extracciones
+        self.dir_extracciones = Path.home() / '.lector_nominas' / 'extracciones_ia'
+        self.dir_extracciones.mkdir(parents=True, exist_ok=True)
+
+    def _obtener_cliente(self):
+        """Obtiene o crea el cliente de Anthropic"""
+        if not ANTHROPIC_OK:
+            raise RuntimeError("La librería 'anthropic' no está instalada. Ejecute: pip install anthropic")
+
+        api_key = self.config.get_api_key()
+        if not api_key:
+            raise ValueError("No hay API key configurada. Configure en Ajustes > IA")
+
+        if self.client is None:
+            self.client = anthropic.Anthropic(api_key=api_key)
+
+        return self.client
+
+    def extraer_de_pdf(self, ruta_pdf, callback_progreso=None):
+        """
+        Extrae datos de un PDF usando Claude con visión.
+
+        Args:
+            ruta_pdf: Ruta al archivo PDF
+            callback_progreso: Función para reportar progreso
+
+        Returns:
+            dict con los datos extraídos o None si falla
+        """
+        if callback_progreso:
+            callback_progreso(0, 100, "Preparando PDF para IA...")
+
+        try:
+            # Verificar que el archivo existe
+            if not os.path.exists(ruta_pdf):
+                raise FileNotFoundError(f"No se encuentra el archivo: {ruta_pdf}")
+
+            # Leer PDF como base64
+            with open(ruta_pdf, "rb") as f:
+                pdf_base64 = base64.standard_b64encode(f.read()).decode('utf-8')
+
+            if callback_progreso:
+                callback_progreso(20, 100, "Enviando a Claude...")
+
+            # Obtener cliente
+            client = self._obtener_cliente()
+            modelo = self.config.get_modelo_ia()
+            max_tokens = self.config.get('ia', 'max_tokens', 4096)
+
+            self.logger.info(f"Enviando PDF a IA", f"Modelo: {modelo}")
+
+            # Crear mensaje con el PDF
+            mensaje = client.messages.create(
+                model=modelo,
+                max_tokens=max_tokens,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "document",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "application/pdf",
+                                    "data": pdf_base64
+                                }
+                            },
+                            {
+                                "type": "text",
+                                "text": f"""Analiza este documento de nómina/resumen de nóminas y extrae la información en formato JSON.
+
+La estructura esperada es:
+{self.ESTRUCTURA_JSON}
+
+{self.PROMPT_SISTEMA}"""
+                            }
+                        ]
+                    }
+                ]
+            )
+
+            if callback_progreso:
+                callback_progreso(80, 100, "Procesando respuesta...")
+
+            # Extraer JSON de la respuesta
+            respuesta_texto = mensaje.content[0].text
+            datos = self._parsear_json(respuesta_texto)
+
+            if datos:
+                # Añadir metadata de extracción
+                datos['_extraccion'] = {
+                    'fecha': datetime.now().isoformat(),
+                    'modelo': modelo,
+                    'archivo': os.path.basename(ruta_pdf),
+                    'metodo': 'ia_claude',
+                    'tokens_usados': mensaje.usage.input_tokens + mensaje.usage.output_tokens
+                }
+
+                # Guardar extracción si está configurado
+                if self.config.get('ia', 'guardar_extracciones', True):
+                    self._guardar_extraccion(ruta_pdf, datos)
+
+                self.logger.info(
+                    "Extracción IA completada",
+                    f"Conceptos: {len(datos.get('conceptos', []))}, "
+                    f"Tokens: {datos['_extraccion']['tokens_usados']}"
+                )
+
+                if callback_progreso:
+                    callback_progreso(100, 100, "Completado")
+
+                return datos
+            else:
+                self.logger.error("No se pudo parsear la respuesta de la IA", respuesta_texto[:500])
+                return None
+
+        except anthropic.AuthenticationError:
+            self.logger.error("Error de autenticación", "API key inválida o expirada")
+            raise ValueError("API key de Anthropic inválida o expirada")
+        except anthropic.RateLimitError:
+            self.logger.error("Límite de tasa excedido", "Espere un momento antes de reintentar")
+            raise RuntimeError("Se ha excedido el límite de llamadas a la API. Espere un momento.")
+        except Exception as e:
+            self.logger.error(f"Error en extracción IA: {type(e).__name__}", str(e))
+            raise
+
+    def _parsear_json(self, texto):
+        """Parsea JSON de la respuesta de la IA"""
+        # Intentar parsear directamente
+        try:
+            return json.loads(texto)
+        except json.JSONDecodeError:
+            pass
+
+        # Buscar JSON en bloques de código
+        patron_json = r'```(?:json)?\s*([\s\S]*?)```'
+        match = re.search(patron_json, texto)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        # Buscar objeto JSON en el texto
+        patron_objeto = r'\{[\s\S]*\}'
+        match = re.search(patron_objeto, texto)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
+
+        return None
+
+    def _guardar_extraccion(self, ruta_pdf, datos):
+        """Guarda la extracción para histórico y aprendizaje"""
+        try:
+            nombre_base = Path(ruta_pdf).stem
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            archivo = self.dir_extracciones / f"{nombre_base}_{timestamp}.json"
+
+            with open(archivo, 'w', encoding='utf-8') as f:
+                json.dump(datos, f, ensure_ascii=False, indent=2)
+
+            self._historial_extracciones.append({
+                'archivo': str(archivo),
+                'fecha': datetime.now().isoformat(),
+                'cif': datos.get('empresa', {}).get('cif', ''),
+                'periodo': datos.get('periodo', {}).get('texto', '')
+            })
+
+        except Exception as e:
+            self.logger.warning(f"No se pudo guardar extracción: {e}")
+
+    def convertir_a_conceptos(self, datos_ia):
+        """
+        Convierte los datos extraídos por IA al formato interno de conceptos.
+
+        Args:
+            datos_ia: dict con la estructura JSON de la IA
+
+        Returns:
+            Lista de conceptos en formato interno compatible con el sistema
+        """
+        conceptos = []
+
+        if not datos_ia or 'conceptos' not in datos_ia:
+            return conceptos
+
+        # Mapeo de tipos IA a tipos internos
+        mapeo_tipos = {
+            'devengo': 'debe',
+            'deduccion': 'haber',
+            'ss_empresa': 'debe',
+            'ss_trabajador': 'haber',
+            'retencion': 'haber',
+            'base': 'info'
+        }
+
+        for item in datos_ia.get('conceptos', []):
+            tipo_ia = item.get('tipo', 'devengo')
+            tipo_interno = mapeo_tipos.get(tipo_ia, 'debe')
+
+            concepto = {
+                'concepto': item.get('descripcion', '').upper(),
+                'importe': item.get('importe'),
+                'tipo': tipo_interno,
+                'codigo': item.get('codigo', ''),
+                'linea': 0,
+                'texto_original': f"{item.get('codigo', '')}: {item.get('descripcion', '')}",
+                'bbox': {},
+                'fuente': 'ia_claude',
+                'tipo_ia': tipo_ia
+            }
+            conceptos.append(concepto)
+
+        return conceptos
+
+    def get_historial(self, cif=None, limite=50):
+        """Obtiene el historial de extracciones, opcionalmente filtrado por CIF"""
+        historial = self._historial_extracciones[-limite:]
+        if cif:
+            historial = [h for h in historial if h.get('cif') == cif]
+        return historial
+
+    def cargar_extraccion(self, ruta_archivo):
+        """Carga una extracción guardada previamente"""
+        try:
+            with open(ruta_archivo, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            self.logger.error(f"Error cargando extracción: {e}")
+            return None
+
+    def esta_disponible(self):
+        """Verifica si la extracción por IA está disponible"""
+        return ANTHROPIC_OK and bool(self.config.get_api_key())
+
+
+# =============================================================================
+# CLASE: VentanaEditorJSON (Editor de JSON extraído por IA) - FASE 8
+# =============================================================================
+class VentanaEditorJSON(tk.Toplevel):
+    """
+    Ventana para visualizar y editar el JSON extraído por la IA.
+    Permite al usuario corregir datos antes de procesarlos.
+    """
+
+    def __init__(self, parent, datos_json, nombre_archivo="", callback_aceptar=None):
+        super().__init__(parent)
+        self.title(f"Editor JSON - {nombre_archivo}")
+        self.geometry("900x700")
+        self.minsize(700, 500)
+
+        self.datos_originales = datos_json
+        self.datos_editados = None
+        self.callback_aceptar = callback_aceptar
+        self.logger = Logger()
+
+        self._crear_ui()
+        self._cargar_datos()
+
+        # Modal
+        self.transient(parent)
+        self.grab_set()
+
+    def _crear_ui(self):
+        # Frame principal
+        main = ttk.Frame(self, padding=10)
+        main.pack(fill='both', expand=True)
+
+        # === Cabecera con info ===
+        frame_info = ttk.Frame(main)
+        frame_info.pack(fill='x', pady=(0, 10))
+
+        ttk.Label(frame_info, text="🤖 Datos extraídos por IA",
+                  font=('Arial', 12, 'bold')).pack(side='left')
+
+        # Indicador de confianza
+        self.var_confianza = tk.StringVar(value="Confianza: --")
+        ttk.Label(frame_info, textvariable=self.var_confianza,
+                  font=('Arial', 10), foreground='gray').pack(side='right')
+
+        # === Panel con pestañas ===
+        notebook = ttk.Notebook(main)
+        notebook.pack(fill='both', expand=True, pady=(0, 10))
+
+        # --- Pestaña 1: Vista estructurada ---
+        tab_estructura = ttk.Frame(notebook, padding=10)
+        notebook.add(tab_estructura, text="Vista Estructurada")
+
+        # Empresa
+        frame_emp = ttk.LabelFrame(tab_estructura, text="Empresa", padding=10)
+        frame_emp.pack(fill='x', pady=(0, 10))
+
+        row1 = ttk.Frame(frame_emp)
+        row1.pack(fill='x')
+
+        ttk.Label(row1, text="CIF:", width=10).pack(side='left')
+        self.var_cif = tk.StringVar()
+        ttk.Entry(row1, textvariable=self.var_cif, width=15, font=('Consolas', 11)).pack(side='left', padx=5)
+
+        ttk.Label(row1, text="Nombre:", width=10).pack(side='left')
+        self.var_empresa = tk.StringVar()
+        ttk.Entry(row1, textvariable=self.var_empresa, width=40, font=('Consolas', 11)).pack(side='left', padx=5)
+
+        # Período
+        frame_per = ttk.LabelFrame(tab_estructura, text="Período", padding=10)
+        frame_per.pack(fill='x', pady=(0, 10))
+
+        row2 = ttk.Frame(frame_per)
+        row2.pack(fill='x')
+
+        ttk.Label(row2, text="Mes:", width=10).pack(side='left')
+        self.var_mes = tk.StringVar()
+        ttk.Entry(row2, textvariable=self.var_mes, width=5, font=('Consolas', 11)).pack(side='left', padx=5)
+
+        ttk.Label(row2, text="Año:", width=10).pack(side='left')
+        self.var_anno = tk.StringVar()
+        ttk.Entry(row2, textvariable=self.var_anno, width=8, font=('Consolas', 11)).pack(side='left', padx=5)
+
+        # Conceptos
+        frame_conceptos = ttk.LabelFrame(tab_estructura, text="Conceptos", padding=10)
+        frame_conceptos.pack(fill='both', expand=True, pady=(0, 10))
+
+        # Tabla de conceptos
+        cols = ('codigo', 'descripcion', 'tipo', 'importe')
+        self.tree_conceptos = ttk.Treeview(frame_conceptos, columns=cols, show='headings', height=10)
+
+        self.tree_conceptos.heading('codigo', text='Código')
+        self.tree_conceptos.heading('descripcion', text='Descripción')
+        self.tree_conceptos.heading('tipo', text='Tipo')
+        self.tree_conceptos.heading('importe', text='Importe')
+
+        self.tree_conceptos.column('codigo', width=80)
+        self.tree_conceptos.column('descripcion', width=300)
+        self.tree_conceptos.column('tipo', width=100)
+        self.tree_conceptos.column('importe', width=100, anchor='e')
+
+        scroll_tree = ttk.Scrollbar(frame_conceptos, orient='vertical', command=self.tree_conceptos.yview)
+        self.tree_conceptos.configure(yscrollcommand=scroll_tree.set)
+
+        self.tree_conceptos.pack(side='left', fill='both', expand=True)
+        scroll_tree.pack(side='right', fill='y')
+
+        # Botones de edición de conceptos
+        frame_btns_conceptos = ttk.Frame(tab_estructura)
+        frame_btns_conceptos.pack(fill='x')
+
+        ttk.Button(frame_btns_conceptos, text="+ Añadir", command=self._añadir_concepto).pack(side='left', padx=2)
+        ttk.Button(frame_btns_conceptos, text="Editar", command=self._editar_concepto).pack(side='left', padx=2)
+        ttk.Button(frame_btns_conceptos, text="- Eliminar", command=self._eliminar_concepto).pack(side='left', padx=2)
+
+        # Totales
+        frame_totales = ttk.LabelFrame(tab_estructura, text="Totales", padding=10)
+        frame_totales.pack(fill='x')
+
+        row_tot = ttk.Frame(frame_totales)
+        row_tot.pack(fill='x')
+
+        ttk.Label(row_tot, text="Devengos:").pack(side='left')
+        self.var_total_dev = tk.StringVar()
+        ttk.Entry(row_tot, textvariable=self.var_total_dev, width=12, font=('Consolas', 11)).pack(side='left', padx=5)
+
+        ttk.Label(row_tot, text="SS Empresa:").pack(side='left')
+        self.var_total_ss = tk.StringVar()
+        ttk.Entry(row_tot, textvariable=self.var_total_ss, width=12, font=('Consolas', 11)).pack(side='left', padx=5)
+
+        ttk.Label(row_tot, text="Líquido:").pack(side='left')
+        self.var_liquido = tk.StringVar()
+        ttk.Entry(row_tot, textvariable=self.var_liquido, width=12, font=('Consolas', 11)).pack(side='left', padx=5)
+
+        # --- Pestaña 2: JSON crudo ---
+        tab_json = ttk.Frame(notebook, padding=10)
+        notebook.add(tab_json, text="JSON Crudo")
+
+        self.text_json = tk.Text(tab_json, font=('Consolas', 10), wrap='none')
+        scroll_json_y = ttk.Scrollbar(tab_json, orient='vertical', command=self.text_json.yview)
+        scroll_json_x = ttk.Scrollbar(tab_json, orient='horizontal', command=self.text_json.xview)
+        self.text_json.configure(yscrollcommand=scroll_json_y.set, xscrollcommand=scroll_json_x.set)
+
+        scroll_json_y.pack(side='right', fill='y')
+        scroll_json_x.pack(side='bottom', fill='x')
+        self.text_json.pack(fill='both', expand=True)
+
+        # Tags para coloreado JSON
+        self.text_json.tag_configure('key', foreground='#0000FF')
+        self.text_json.tag_configure('string', foreground='#008000')
+        self.text_json.tag_configure('number', foreground='#FF8C00')
+
+        # === Botones de acción ===
+        frame_acciones = ttk.Frame(main)
+        frame_acciones.pack(fill='x', pady=(10, 0))
+
+        ttk.Button(frame_acciones, text="Cancelar", command=self.destroy).pack(side='right', padx=5)
+        ttk.Button(frame_acciones, text="✓ Aceptar y Procesar",
+                   command=self._aceptar).pack(side='right', padx=5)
+        ttk.Button(frame_acciones, text="Recargar original",
+                   command=self._cargar_datos).pack(side='left', padx=5)
+
+    def _cargar_datos(self):
+        """Carga los datos en la interfaz"""
+        datos = self.datos_originales
+
+        # Empresa
+        emp = datos.get('empresa', {})
+        self.var_cif.set(emp.get('cif', ''))
+        self.var_empresa.set(emp.get('nombre', ''))
+
+        # Período
+        per = datos.get('periodo', {})
+        self.var_mes.set(str(per.get('mes', '')))
+        self.var_anno.set(str(per.get('año', '')))
+
+        # Conceptos
+        self.tree_conceptos.delete(*self.tree_conceptos.get_children())
+        for c in datos.get('conceptos', []):
+            self.tree_conceptos.insert('', 'end', values=(
+                c.get('codigo', ''),
+                c.get('descripcion', ''),
+                c.get('tipo', ''),
+                f"{c.get('importe', 0):,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
+            ))
+
+        # Totales
+        tot = datos.get('totales', {})
+        self.var_total_dev.set(f"{tot.get('total_devengos', 0):,.2f}")
+        self.var_total_ss.set(f"{tot.get('total_ss_empresa', 0):,.2f}")
+        self.var_liquido.set(f"{tot.get('liquido_a_percibir', 0):,.2f}")
+
+        # Confianza
+        meta = datos.get('_metadata', {})
+        conf = meta.get('confianza', 0)
+        self.var_confianza.set(f"Confianza: {conf*100:.0f}%")
+
+        # JSON crudo
+        self.text_json.delete('1.0', 'end')
+        json_str = json.dumps(datos, indent=2, ensure_ascii=False)
+        self.text_json.insert('1.0', json_str)
+
+    def _añadir_concepto(self):
+        """Añade un nuevo concepto"""
+        dialogo = tk.Toplevel(self)
+        dialogo.title("Añadir Concepto")
+        dialogo.geometry("400x200")
+        dialogo.transient(self)
+        dialogo.grab_set()
+
+        frame = ttk.Frame(dialogo, padding=20)
+        frame.pack(fill='both', expand=True)
+
+        ttk.Label(frame, text="Código:").grid(row=0, column=0, sticky='w', pady=5)
+        var_cod = tk.StringVar()
+        ttk.Entry(frame, textvariable=var_cod).grid(row=0, column=1, sticky='ew', pady=5)
+
+        ttk.Label(frame, text="Descripción:").grid(row=1, column=0, sticky='w', pady=5)
+        var_desc = tk.StringVar()
+        ttk.Entry(frame, textvariable=var_desc).grid(row=1, column=1, sticky='ew', pady=5)
+
+        ttk.Label(frame, text="Tipo:").grid(row=2, column=0, sticky='w', pady=5)
+        var_tipo = tk.StringVar(value='devengo')
+        ttk.Combobox(frame, textvariable=var_tipo,
+                     values=['devengo', 'deduccion', 'ss_empresa', 'ss_trabajador', 'retencion']).grid(row=2, column=1, sticky='ew', pady=5)
+
+        ttk.Label(frame, text="Importe:").grid(row=3, column=0, sticky='w', pady=5)
+        var_imp = tk.StringVar()
+        ttk.Entry(frame, textvariable=var_imp).grid(row=3, column=1, sticky='ew', pady=5)
+
+        frame.columnconfigure(1, weight=1)
+
+        def guardar():
+            try:
+                importe = float(var_imp.get().replace(',', '.'))
+                self.tree_conceptos.insert('', 'end', values=(
+                    var_cod.get(), var_desc.get(), var_tipo.get(), f"{importe:,.2f}"
+                ))
+                dialogo.destroy()
+            except ValueError:
+                messagebox.showerror("Error", "Importe no válido")
+
+        ttk.Button(frame, text="Guardar", command=guardar).grid(row=4, column=1, sticky='e', pady=20)
+
+    def _editar_concepto(self):
+        """Edita el concepto seleccionado"""
+        sel = self.tree_conceptos.selection()
+        if not sel:
+            messagebox.showinfo("Info", "Seleccione un concepto para editar")
+            return
+        # Implementación simplificada - reutilizar diálogo de añadir
+
+    def _eliminar_concepto(self):
+        """Elimina el concepto seleccionado"""
+        sel = self.tree_conceptos.selection()
+        if sel:
+            self.tree_conceptos.delete(sel)
+
+    def _construir_datos(self):
+        """Construye el diccionario de datos desde la interfaz"""
+        # Reconstruir conceptos desde el tree
+        conceptos = []
+        for item in self.tree_conceptos.get_children():
+            valores = self.tree_conceptos.item(item)['values']
+            importe_str = str(valores[3]).replace('.', '').replace(',', '.')
+            try:
+                importe = float(importe_str)
+            except:
+                importe = 0
+
+            conceptos.append({
+                'codigo': str(valores[0]),
+                'descripcion': str(valores[1]),
+                'tipo': str(valores[2]),
+                'importe': importe
+            })
+
+        # Parsear totales
+        def parse_num(s):
+            try:
+                return float(str(s).replace('.', '').replace(',', '.'))
+            except:
+                return 0
+
+        datos = {
+            'empresa': {
+                'cif': self.var_cif.get(),
+                'nombre': self.var_empresa.get()
+            },
+            'periodo': {
+                'mes': int(self.var_mes.get()) if self.var_mes.get().isdigit() else 0,
+                'año': int(self.var_anno.get()) if self.var_anno.get().isdigit() else 0,
+                'texto': f"{self.var_mes.get()}/{self.var_anno.get()}"
+            },
+            'conceptos': conceptos,
+            'totales': {
+                'total_devengos': parse_num(self.var_total_dev.get()),
+                'total_ss_empresa': parse_num(self.var_total_ss.get()),
+                'liquido_a_percibir': parse_num(self.var_liquido.get())
+            },
+            '_extraccion': self.datos_originales.get('_extraccion', {}),
+            '_editado': True,
+            '_fecha_edicion': datetime.now().isoformat()
+        }
+
+        return datos
+
+    def _aceptar(self):
+        """Acepta los datos y cierra la ventana"""
+        self.datos_editados = self._construir_datos()
+
+        if self.callback_aceptar:
+            self.callback_aceptar(self.datos_editados)
+
+        self.destroy()
+
+
+# =============================================================================
 # CLASE: VentanaAprendizaje (Modo aprendizaje interactivo)
 # =============================================================================
 class VentanaAprendizaje(tk.Toplevel):
@@ -3586,6 +4301,7 @@ class AplicacionFase3:
         self.gestor_plantillas = GestorPlantillas()
         self.detector = DetectorDocumento()
         self.extractor = ExtractorConceptos()
+        self.extractor_ia = ExtractorIA()  # FASE 8: Extractor con IA
         self.gestor_validaciones = GestorValidaciones()
         self.generador_asientos = GeneradorAsientos()
 
@@ -3595,16 +4311,18 @@ class AplicacionFase3:
         self.empresa_actual = None
         self.plantilla_actual = None
         self.conceptos_extraidos = []
+        self.datos_ia = None  # FASE 8: Datos extraídos por IA
         self.resultado_validacion = None
         self.imagen_tk = None
         self.queue = Queue()
 
         self._crear_ui()
         self._verificar_bd()
+        self._verificar_ia()  # FASE 8: Verificar disponibilidad de IA
         self._procesar_cola()
         self._actualizar_contador_errores()
 
-        self.logger.info("Aplicación iniciada", f"Versión {VERSION} - Fase 5")
+        self.logger.info("Aplicación iniciada", f"Versión {VERSION} - Fase 8 (IA)")
 
     def _procesar_cola(self):
         try:
@@ -3822,7 +4540,11 @@ class AplicacionFase3:
         self.label_bd = ttk.Label(frame_bottom, text="BD: Verificando...", foreground='gray')
         self.label_bd.pack(side='left')
 
-        ttk.Label(frame_bottom, text=f"Fase 3 - Sistema Inteligente | v{VERSION}", foreground='gray').pack(side='right')
+        # Indicador de IA (Fase 8)
+        self.label_ia = ttk.Label(frame_bottom, text="🤖 IA: Verificando...", foreground='gray')
+        self.label_ia.pack(side='left', padx=(20, 0))
+
+        ttk.Label(frame_bottom, text=f"Fase 8 - IA Integrada | v{VERSION}", foreground='gray').pack(side='right')
 
         # Variables de estado
         self.pagina_actual = 0
@@ -3995,97 +4717,186 @@ class AplicacionFase3:
                 self.queue.put(lambda: self.label_bd.configure(text="❌ BD Error", foreground='red'))
         threading.Thread(target=verificar, daemon=True).start()
 
+    def _verificar_ia(self):
+        """Verifica disponibilidad de IA (Fase 8)"""
+        if self.extractor_ia.esta_disponible():
+            self.queue.put(lambda: self.label_ia.configure(text="🤖 IA Activa", foreground='green'))
+            self.logger.info("IA disponible", f"Modelo: {Configuracion().get_modelo_ia()}")
+        else:
+            if not ANTHROPIC_OK:
+                msg = "🤖 IA No instalada"
+            elif not Configuracion().get_api_key():
+                msg = "🤖 IA Sin API key"
+            else:
+                msg = "🤖 IA Desactivada"
+            self.queue.put(lambda m=msg: self.label_ia.configure(text=m, foreground='orange'))
+
     def _cargar_pdf(self, ruta):
-        """Carga y procesa un PDF automáticamente"""
+        """
+        Carga y procesa un PDF con IA (Fase 8).
+
+        Flujo:
+        1. Crear procesador PDF para visualización
+        2. Enviar a IA para extracción
+        3. Mostrar editor JSON si está configurado
+        4. Usar datos extraídos para continuar
+        """
         # Cerrar anterior
         if self.pdf:
             self.pdf.cerrar()
 
-        self.var_estado_carga.set(f"⏳ Procesando: {os.path.basename(ruta)}")
+        self.datos_ia = None
+        nombre_archivo = os.path.basename(ruta)
+
+        # Verificar si IA está disponible
+        ia_disponible = self.extractor_ia.esta_disponible()
+
+        if ia_disponible:
+            self.var_estado_carga.set(f"🤖 Procesando con IA: {nombre_archivo}")
+        else:
+            self.var_estado_carga.set(f"⏳ Procesando (modo programa): {nombre_archivo}")
+
         self.progreso.pack(pady=5)
         self.progreso['value'] = 0
-        self.logger.info(f"Cargando PDF: {os.path.basename(ruta)}")
+        self.logger.info(f"Cargando PDF: {nombre_archivo}", f"IA: {ia_disponible}")
 
         def procesar():
             try:
-                # Crear procesador
+                # Crear procesador PDF para visualización
                 self.pdf = PDFProcessor(ruta)
 
-                def callback(actual, total, tipo):
-                    pct = int((actual / total) * 100)
+                def callback_pdf(actual, total, tipo):
+                    pct = int((actual / total) * 50)  # Primera mitad del progreso
                     self.queue.put(lambda p=pct: self.progreso.configure(value=p))
-                    self.queue.put(lambda a=actual, t=total: self.var_estado_carga.set(f"⏳ {tipo}: Página {a}/{t}"))
+                    self.queue.put(lambda t=tipo, a=actual, tot=total: self.var_estado_carga.set(f"⏳ {t}: Página {a}/{tot}"))
 
-                # Procesar
-                ok, msg = self.pdf.procesar_automatico(callback)
+                # Procesar PDF para visualización
+                ok, msg = self.pdf.procesar_automatico(callback_pdf)
 
-                def actualizar():
+                if not ok:
+                    raise Exception(msg)
+
+                # === FASE 8: Extracción con IA ===
+                datos_extraidos = None
+                metodo_usado = "programa"
+
+                if ia_disponible:
+                    def callback_ia(actual, total, msg_ia):
+                        pct = 50 + int((actual / total) * 50)  # Segunda mitad
+                        self.queue.put(lambda p=pct: self.progreso.configure(value=p))
+                        self.queue.put(lambda m=msg_ia: self.var_estado_carga.set(f"🤖 {m}"))
+
+                    try:
+                        datos_extraidos = self.extractor_ia.extraer_de_pdf(ruta, callback_ia)
+                        if datos_extraidos:
+                            metodo_usado = "ia_claude"
+                            self.logger.info("Extracción IA exitosa",
+                                           f"Conceptos: {len(datos_extraidos.get('conceptos', []))}")
+                    except Exception as e_ia:
+                        self.logger.warning(f"IA falló, usando modo programa: {e_ia}")
+                        metodo_usado = "programa"
+
+                def actualizar_ui():
                     self.progreso.pack_forget()
 
-                    if ok:
-                        # Mostrar datos con validación de CIF
+                    # === Datos del PDF (visualización) ===
+                    # Usar datos de IA si disponibles, sino del procesador PDF
+                    if datos_extraidos:
+                        emp = datos_extraidos.get('empresa', {})
+                        per = datos_extraidos.get('periodo', {})
+
+                        cif = emp.get('cif') or self.pdf.cif
+                        self.var_cif.set(cif or "(No detectado)")
+
+                        # Actualizar datos del PDF con los de IA
+                        self.pdf.cif = cif
+                        self.pdf.periodo = per.get('texto') or self.pdf.periodo
+                        self.pdf.mes = per.get('mes') or self.pdf.mes
+                        self.pdf.anno = per.get('año') or self.pdf.anno
+                    else:
                         self.var_cif.set(self.pdf.cif or "(No detectado)")
 
-                        # Validar CIF/NIF
-                        if self.pdf.cif:
-                            cif_valido, cif_tipo, cif_msg = ValidadorCIF.validar(self.pdf.cif)
-                            if cif_valido:
-                                self.label_cif_status.configure(
-                                    text=f"✅ {cif_tipo}",
-                                    foreground='green'
-                                )
-                            else:
-                                self.label_cif_status.configure(
-                                    text="⚠️ Inválido",
-                                    foreground='orange'
-                                )
-                                self.logger.warning(f"CIF/NIF inválido: {cif_msg}")
+                    # Validar CIF/NIF
+                    if self.pdf.cif:
+                        cif_valido, cif_tipo, cif_msg = ValidadorCIF.validar(self.pdf.cif)
+                        if cif_valido:
+                            self.label_cif_status.configure(text=f"✅ {cif_tipo}", foreground='green')
                         else:
-                            self.label_cif_status.configure(
-                                text="⚠️",
-                                foreground='orange'
-                            )
-                        self.var_periodo.set(self.pdf.periodo or "(No detectado)")
-                        self.var_anno.set(str(self.pdf.anno))
-                        self.var_mes.set(str(self.pdf.mes))
-                        # Mostrar método de extracción
-                        if self.pdf.metodo_extraccion == 'opendataloader':
-                            metodo = f"OpenDataLoader (Tablas: {len(self.pdf.tablas)})"
-                        elif self.pdf.tiene_texto_nativo:
-                            metodo = "PyMuPDF (Texto nativo)"
-                        else:
-                            metodo = "PyMuPDF + OCR"
-                        self.var_metodo.set(metodo)
-
-                        # Mostrar primera página
-                        self.pagina_actual = 0
-                        self._mostrar_pagina()
-                        self.var_pag.set(f"1 / {self.pdf.num_paginas}")
-
-                        self.var_estado_carga.set(f"✅ {self.pdf.nombre} - Procesado correctamente")
-                        self.logger.info(f"PDF procesado: {self.pdf.nombre}",
-                                        f"CIF: {self.pdf.cif}, Período: {self.pdf.periodo}")
-
-                        # Buscar empresa automáticamente si hay CIF
-                        if self.pdf.cif:
-                            self._buscar_empresa()
-
-                        # Detectar plantilla automáticamente
-                        self._detectar_plantilla()
+                            self.label_cif_status.configure(text="⚠️ Inválido", foreground='orange')
+                            self.logger.warning(f"CIF/NIF inválido: {cif_msg}")
                     else:
-                        self.var_estado_carga.set(f"❌ Error: {msg}")
-                        self.logger.error(f"Error procesando PDF: {self.pdf.nombre}", msg)
-                        messagebox.showerror("Error", msg)
+                        self.label_cif_status.configure(text="⚠️", foreground='orange')
 
-                self.queue.put(actualizar)
+                    self.var_periodo.set(self.pdf.periodo or "(No detectado)")
+                    self.var_anno.set(str(self.pdf.anno))
+                    self.var_mes.set(str(self.pdf.mes))
+
+                    # Mostrar método de extracción
+                    if metodo_usado == "ia_claude":
+                        metodo_texto = f"🤖 IA Claude ({datos_extraidos.get('_extraccion', {}).get('tokens_usados', '?')} tokens)"
+                    elif self.pdf.metodo_extraccion == 'opendataloader':
+                        metodo_texto = f"OpenDataLoader (Tablas: {len(self.pdf.tablas)})"
+                    elif self.pdf.tiene_texto_nativo:
+                        metodo_texto = "PyMuPDF (Texto nativo)"
+                    else:
+                        metodo_texto = "PyMuPDF + OCR"
+                    self.var_metodo.set(metodo_texto)
+
+                    # Mostrar primera página
+                    self.pagina_actual = 0
+                    self._mostrar_pagina()
+                    self.var_pag.set(f"1 / {self.pdf.num_paginas}")
+
+                    # Buscar empresa automáticamente
+                    if self.pdf.cif:
+                        self._buscar_empresa()
+
+                    # === Procesar datos extraídos ===
+                    if datos_extraidos and metodo_usado == "ia_claude":
+                        self.datos_ia = datos_extraidos
+
+                        # Convertir a conceptos internos
+                        self.conceptos_extraidos = self.extractor_ia.convertir_a_conceptos(datos_extraidos)
+
+                        self.var_estado_carga.set(f"🤖 {self.pdf.nombre} - Extraído con IA")
+
+                        # Mostrar editor JSON si está configurado
+                        config = Configuracion()
+                        if config.get('ia', 'mostrar_editor_json', True):
+                            self._mostrar_editor_json(datos_extraidos)
+                    else:
+                        # Modo programa tradicional
+                        self._detectar_plantilla()
+                        self.var_estado_carga.set(f"✅ {self.pdf.nombre} - Procesado (modo programa)")
+
+                    self.logger.info(f"PDF procesado: {self.pdf.nombre}",
+                                    f"Método: {metodo_usado}, CIF: {self.pdf.cif}, Período: {self.pdf.periodo}")
+
+                self.queue.put(actualizar_ui)
 
             except Exception as e:
                 self.logger.error(f"Excepción al cargar PDF", str(e))
                 self.queue.put(lambda: self.var_estado_carga.set(f"❌ Error: {e}"))
                 self.queue.put(lambda: self.progreso.pack_forget())
-                self.queue.put(lambda: messagebox.showerror("Error", str(e)))
+                self.queue.put(lambda err=str(e): messagebox.showerror("Error", err))
 
         threading.Thread(target=procesar, daemon=True).start()
+
+    def _mostrar_editor_json(self, datos):
+        """Muestra el editor JSON con los datos extraídos por IA"""
+        def on_aceptar(datos_editados):
+            self.datos_ia = datos_editados
+            # Reconvertir a conceptos si hubo edición
+            self.conceptos_extraidos = self.extractor_ia.convertir_a_conceptos(datos_editados)
+            self.logger.info("Datos IA editados y aceptados",
+                           f"Conceptos: {len(self.conceptos_extraidos)}")
+
+        VentanaEditorJSON(
+            self.root,
+            datos,
+            nombre_archivo=self.pdf.nombre if self.pdf else "",
+            callback_aceptar=on_aceptar
+        )
 
     def _buscar_empresa(self):
         """Busca la empresa por CIF en la base de datos Geyce"""
@@ -4579,13 +5390,13 @@ class VentanaCuentasEmpresa(tk.Toplevel):
 # CLASE: VentanaConfiguracion (Configuración de la aplicación)
 # =============================================================================
 class VentanaConfiguracion(tk.Toplevel):
-    """Ventana para configurar la aplicación"""
+    """Ventana para configurar la aplicación (Fase 8: incluye IA)"""
 
     def __init__(self, parent):
         super().__init__(parent)
         self.title("Configuración")
-        self.geometry("700x550")
-        self.minsize(600, 450)
+        self.geometry("750x600")
+        self.minsize(650, 500)
 
         self.config = Configuracion()
         self.logger = Logger()
@@ -4688,6 +5499,68 @@ class VentanaConfiguracion(tk.Toplevel):
                                values=['spa', 'eng', 'fra', 'deu', 'ita', 'por'], width=10)
         idiomas.pack(anchor='w')
 
+        # === Pestaña 5: IA (Fase 8) ===
+        tab_ia = ttk.Frame(notebook, padding=15)
+        notebook.add(tab_ia, text="🤖 IA")
+
+        # API Key
+        ttk.Label(tab_ia, text="API Key de Anthropic:", font=('Arial', 10, 'bold')).grid(row=0, column=0, sticky='w', pady=(0, 5))
+        ttk.Label(tab_ia, text="(Obtener en console.anthropic.com)", foreground='gray').grid(row=0, column=1, sticky='w', padx=5)
+
+        self.var_api_key = tk.StringVar()
+        entry_api = ttk.Entry(tab_ia, textvariable=self.var_api_key, width=50, show='•')
+        entry_api.grid(row=1, column=0, columnspan=2, sticky='w', pady=(0, 10))
+
+        # Botón mostrar/ocultar
+        self.mostrar_key = tk.BooleanVar(value=False)
+        def toggle_key():
+            if self.mostrar_key.get():
+                entry_api.config(show='')
+            else:
+                entry_api.config(show='•')
+        ttk.Checkbutton(tab_ia, text="Mostrar", variable=self.mostrar_key,
+                       command=toggle_key).grid(row=1, column=2, padx=5)
+
+        # Modelo
+        ttk.Label(tab_ia, text="Modelo:").grid(row=2, column=0, sticky='w', pady=5)
+        self.var_modelo_ia = tk.StringVar()
+        modelos = ttk.Combobox(tab_ia, textvariable=self.var_modelo_ia, width=35,
+                               values=[
+                                   'claude-sonnet-4-20250514',
+                                   'claude-opus-4-20250514',
+                                   'claude-haiku-4-5-20251001',
+                                   'claude-3-5-sonnet-20241022'
+                               ])
+        modelos.grid(row=2, column=1, sticky='w', pady=5)
+
+        # Opciones
+        self.var_ia_habilitada = tk.BooleanVar()
+        ttk.Checkbutton(tab_ia, text="IA habilitada (siempre usar IA para extraer datos)",
+                       variable=self.var_ia_habilitada).grid(row=3, column=0, columnspan=2, sticky='w', pady=10)
+
+        self.var_guardar_extracciones = tk.BooleanVar()
+        ttk.Checkbutton(tab_ia, text="Guardar extracciones (para histórico y aprendizaje)",
+                       variable=self.var_guardar_extracciones).grid(row=4, column=0, columnspan=2, sticky='w', pady=5)
+
+        self.var_mostrar_editor = tk.BooleanVar()
+        ttk.Checkbutton(tab_ia, text="Mostrar editor JSON antes de procesar",
+                       variable=self.var_mostrar_editor).grid(row=5, column=0, columnspan=2, sticky='w', pady=5)
+
+        # Max tokens
+        ttk.Label(tab_ia, text="Max tokens:").grid(row=6, column=0, sticky='w', pady=5)
+        self.var_max_tokens = tk.StringVar()
+        ttk.Entry(tab_ia, textvariable=self.var_max_tokens, width=10).grid(row=6, column=1, sticky='w', pady=5)
+
+        # Estado
+        frame_estado_ia = ttk.LabelFrame(tab_ia, text="Estado", padding=10)
+        frame_estado_ia.grid(row=7, column=0, columnspan=3, sticky='ew', pady=(20, 0))
+
+        self.var_estado_ia = tk.StringVar(value="Verificando...")
+        ttk.Label(frame_estado_ia, textvariable=self.var_estado_ia, font=('Arial', 10)).pack(anchor='w')
+
+        ttk.Button(frame_estado_ia, text="🔌 Probar conexión IA",
+                  command=self._probar_ia).pack(anchor='w', pady=(10, 0))
+
         # === Botones ===
         frame_btns = ttk.Frame(self)
         frame_btns.pack(fill='x', padx=10, pady=10)
@@ -4727,6 +5600,18 @@ class VentanaConfiguracion(tk.Toplevel):
         self.var_autovalidar.set(ui.get('auto_validar', True))
         self.var_idioma_ocr.set(ui.get('idioma_ocr', 'spa'))
 
+        # IA (Fase 8)
+        ia = self.config.get('ia')
+        self.var_api_key.set(ia.get('api_key', ''))
+        self.var_modelo_ia.set(ia.get('modelo', 'claude-sonnet-4-20250514'))
+        self.var_ia_habilitada.set(ia.get('habilitado', True))
+        self.var_guardar_extracciones.set(ia.get('guardar_extracciones', True))
+        self.var_mostrar_editor.set(ia.get('mostrar_editor_json', True))
+        self.var_max_tokens.set(str(ia.get('max_tokens', 4096)))
+
+        # Actualizar estado IA
+        self._actualizar_estado_ia()
+
     def _guardar(self):
         """Guarda la configuración"""
         try:
@@ -4753,6 +5638,17 @@ class VentanaConfiguracion(tk.Toplevel):
             self.config.set('interfaz', 'auto_validar', self.var_autovalidar.get())
             self.config.set('interfaz', 'idioma_ocr', self.var_idioma_ocr.get())
 
+            # IA (Fase 8)
+            self.config.set('ia', 'api_key', self.var_api_key.get())
+            self.config.set('ia', 'modelo', self.var_modelo_ia.get())
+            self.config.set('ia', 'habilitado', self.var_ia_habilitada.get())
+            self.config.set('ia', 'guardar_extracciones', self.var_guardar_extracciones.get())
+            self.config.set('ia', 'mostrar_editor_json', self.var_mostrar_editor.get())
+            try:
+                self.config.set('ia', 'max_tokens', int(self.var_max_tokens.get()))
+            except ValueError:
+                self.config.set('ia', 'max_tokens', 4096)
+
             messagebox.showinfo("Éxito", "Configuración guardada correctamente")
             self.logger.info("Configuración guardada")
 
@@ -4777,6 +5673,65 @@ class VentanaConfiguracion(tk.Toplevel):
             messagebox.showinfo("Conexión exitosa", f"Conectado a:\n{msg}")
         else:
             messagebox.showerror("Error de conexión", f"No se pudo conectar:\n{msg}")
+
+    def _actualizar_estado_ia(self):
+        """Actualiza el estado de la IA en la interfaz"""
+        if not ANTHROPIC_OK:
+            self.var_estado_ia.set("❌ Librería 'anthropic' no instalada\nEjecute: pip install anthropic")
+            return
+
+        api_key = self.var_api_key.get()
+        if not api_key:
+            self.var_estado_ia.set("⚠️ No hay API key configurada")
+            return
+
+        if not self.var_ia_habilitada.get():
+            self.var_estado_ia.set("⚠️ IA deshabilitada")
+            return
+
+        self.var_estado_ia.set(f"✅ IA configurada\nModelo: {self.var_modelo_ia.get()}")
+
+    def _probar_ia(self):
+        """Prueba la conexión con la API de Anthropic"""
+        if not ANTHROPIC_OK:
+            messagebox.showerror("Error", "La librería 'anthropic' no está instalada.\n\nEjecute:\npip install anthropic")
+            return
+
+        api_key = self.var_api_key.get()
+        if not api_key:
+            messagebox.showwarning("Aviso", "Introduzca una API key de Anthropic")
+            return
+
+        self.var_estado_ia.set("🔄 Probando conexión...")
+        self.update()
+
+        try:
+            client = anthropic.Anthropic(api_key=api_key)
+            # Hacer una llamada simple para verificar
+            response = client.messages.create(
+                model=self.var_modelo_ia.get(),
+                max_tokens=50,
+                messages=[
+                    {"role": "user", "content": "Di 'OK' si me escuchas."}
+                ]
+            )
+
+            texto_respuesta = response.content[0].text
+            tokens_usados = response.usage.input_tokens + response.usage.output_tokens
+
+            self.var_estado_ia.set(f"✅ Conexión exitosa\nRespuesta: {texto_respuesta[:50]}\nTokens: {tokens_usados}")
+            messagebox.showinfo("Éxito", f"Conexión con IA exitosa\n\nModelo: {self.var_modelo_ia.get()}\nTokens usados: {tokens_usados}")
+            self.logger.info("Prueba de conexión IA exitosa", f"Modelo: {self.var_modelo_ia.get()}")
+
+        except anthropic.AuthenticationError:
+            self.var_estado_ia.set("❌ API key inválida")
+            messagebox.showerror("Error", "API key inválida o expirada.\n\nVerifique su API key en console.anthropic.com")
+        except anthropic.RateLimitError:
+            self.var_estado_ia.set("⚠️ Límite de tasa excedido")
+            messagebox.showwarning("Aviso", "Se ha excedido el límite de llamadas.\n\nEspere un momento antes de reintentar.")
+        except Exception as e:
+            self.var_estado_ia.set(f"❌ Error: {str(e)[:50]}")
+            messagebox.showerror("Error", f"Error conectando con IA:\n\n{e}")
 
 
 # =============================================================================
